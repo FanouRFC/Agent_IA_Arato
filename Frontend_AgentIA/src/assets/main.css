@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+/* Palette et police du projet (Tailwind v4 : configuration directement en CSS) */
+@theme {
+  --color-paper: #f5f6f3;
+  --color-ink: #17282b;
+  --color-line: #d9ded9;
+  --color-teal: #0f5f59;
+  --color-teal-soft: #dcebe8;
+  --color-brick: #a8402b;
+  --color-brick-soft: #f6e1db;
+  --color-ochre: #8a6112;
+  --color-ochre-soft: #f6ebcd;
+  --font-sans: "IBM Plex Sans", system-ui, sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-paper text-ink font-sans antialiased;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-teal);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white hover:bg-teal/90 disabled:opacity-50;
+  }
+  .btn-quiet {
+    @apply inline-flex items-center rounded-md border border-line bg-white px-3.5 py-2 text-sm font-medium hover:bg-teal-soft;
+  }
+  .field {
+    @apply w-full rounded-md border border-line bg-white px-3 py-2 text-sm;
+  }
+  .panel {
+    @apply rounded-lg border border-line bg-white p-5;
+  }
+  .tag {
+    @apply inline-block rounded px-2 py-0.5 text-xs font-medium;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

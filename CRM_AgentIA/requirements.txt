@@ -1,0 +1,2 @@
+# Le CRM utilise le MÊME environnement virtuel que le backend (Backend_AgentIA\venv) : mêmes versions, aucun écart.
+-r ../Backend_AgentIA/requirements.txt

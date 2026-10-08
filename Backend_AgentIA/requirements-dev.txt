@@ -1,0 +1,4 @@
+# Outils de développement (serveur SMTP de test)
+aiosmtpd==1.4.6
+atpublic==8.0.1
+attrs==26.1.0
