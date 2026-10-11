@@ -259,7 +259,8 @@ def synthese(db: Session = Depends(get_db)):
     for r in recos:                                  # une recommandation en attente de décision par ticket
         if r.id_ticket not in vues:
             vues.add(r.id_ticket)
-            ouvertes.append({"id": r.id, "texte": r.texte, "date": r.date})
+            ouvertes.append({"id": r.id, "texte": r.texte, "date": r.date, "id_ticket": r.id_ticket,
+                 "source": r.source, "diagnostic": r.diagnostic})
     ch = s.chiffres
     return {"id": s.id, "date": s.date, "declencheur": s.declencheur, "contenu": s.contenu,
             "nb_en_retard": len(ch.get("en_retard", [])), "nb_a_surveiller": len(ch.get("a_surveiller", [])),
@@ -269,7 +270,8 @@ def synthese(db: Session = Depends(get_db)):
 
 @router.post("/synthese/actualiser")
 def actualiser(bg: BackgroundTasks):
-    bg.add_task(service.reevaluate, set(), "manuel")
+    ids = {t["id"] for t in crm.list_tickets() if t["statut"] != "ferme"}
+    bg.add_task(service.reevaluate, ids, "manuel")
     return {"ok": True}
 
 
@@ -304,17 +306,6 @@ def modifier_echeance(tid: int, b: EcheanceIn, bg: BackgroundTasks, db: Session 
     bg.add_task(service.reevaluate, {tid}, "modification de l'échéance")
     return {"ok": True}
 
-
-class ChatIn(BaseModel):
-    question: str = Field(min_length=2)
-
-
-@router.post("/chat")
-def chat(b: ChatIn, db: Session = Depends(get_db)):
-    rep = service.chat(b.question)
-    db.add(ConversationChat(question=b.question, reponse=rep))
-    db.commit()
-    return {"reponse": rep}
 
 
 # ---------------- Rapports (bonus) ----------------
@@ -390,3 +381,15 @@ def evaluation(db: Session = Depends(get_db)):
                             "contenant_relance": sum("relanc" in r.texte.lower() for r in recs),
                             "repli_deterministe": sum(r.source == "fallback" for r in recs)},
     }
+
+class ChatIn(BaseModel):
+    question: str = Field(min_length=2)
+    historique: list[dict] = []
+
+
+@router.post("/chat")
+def chat(b: ChatIn, db: Session = Depends(get_db)):
+    res = service.chat(b.question, b.historique)
+    db.add(ConversationChat(question=b.question, reponse=res["reponse"]))
+    db.commit()
+    return res

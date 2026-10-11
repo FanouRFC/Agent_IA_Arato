@@ -11,6 +11,7 @@ from . import tools as T
 from .connector import connector as crm
 from .db import SessionLocal
 from .models import AnalyseTicket, Recommandation, SuiviRetard, SyntheseSuivi
+from . import agent, chat_agent, settings_store   # ajoute chat_agent
 
 log = logging.getLogger("suivi")
 _lock = threading.RLock()
@@ -150,7 +151,9 @@ def temporal_check():
         log.warning("Contrôle temporel impossible : %s", e)
 
 
-def chat(question: str) -> str:
+
+
+def chat(question: str, historique: list | None = None) -> dict:
     with SessionLocal() as db:
         tickets, tracking, _ = snapshot(db)
-    return agent.chat_answer(question, tickets, tracking, crm.historique)
+    return chat_agent.answer(question, tickets, tracking, crm.membres(), crm.projets(), crm.historique, historique)
