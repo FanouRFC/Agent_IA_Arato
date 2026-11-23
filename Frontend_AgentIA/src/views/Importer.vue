@@ -23,12 +23,26 @@ const nomAuto = ref(false), nom = ref(''), texte = ref(''), fichier = ref<File |
 const analyse = useAnalyseStore()
 const busy = computed(() => analyse.busy)           // l'analyse continue même si l'on quitte la page
 const cahier = ref<any>(null), validating = ref(false), confirm = ref(false), bilan = ref<any>(null), err = ref('')
+
+/** Nom de projet unique et comparaisons sans accents ni majuscules. */
+const cle = (x: string) => x.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase()
+
+// Priorités : vocabulaire « priorité / secondaire / bonus ». Toute autre valeur reçue (ancien « haute / moyenne / basse »,
+// sans accent, majuscules, absente…) est ramenée à l'une des trois, sinon le menu s'affiche vide et la pastille reste violette.
 const PRIORITES = [
-  { v: 'haute', l: 'Haute', c: 'bg-red-500', t: 'text-red-700 bg-red-50' },
-  { v: 'moyenne', l: 'Moyenne', c: 'bg-purple-500', t: 'text-purple-700 bg-purple-50' },
-  { v: 'basse', l: 'Basse', c: 'bg-sky-400', t: 'text-sky-700 bg-sky-50' },
+  { v: 'priorité', l: 'Priorité', c: 'bg-red-500', t: 'text-red-700 bg-red-50' },
+  { v: 'secondaire', l: 'Secondaire', c: 'bg-purple-500', t: 'text-purple-700 bg-purple-50' },
+  { v: 'bonus', l: 'Bonus', c: 'bg-sky-400', t: 'text-sky-700 bg-sky-50' },
 ]
-const prio = (v: string) => PRIORITES.find((p) => p.v === v) ?? PRIORITES[1]!
+const ALIAS_PRIO: Record<string, string> = {
+  priorite: 'priorité', haute: 'priorité', high: 'priorité',
+  secondaire: 'secondaire', moyenne: 'secondaire', medium: 'secondaire',
+  bonus: 'bonus', basse: 'bonus', low: 'bonus',
+}
+const normPrio = (v: any): string => ALIAS_PRIO[cle(String(v ?? ''))] ?? 'secondaire'
+const normaliserCahier = (c: any) => { for (const t of c?.taches ?? []) t.priorite = normPrio(t.priorite); return c }
+const prio = (v: string) => PRIORITES.find((p) => p.v === normPrio(v)) ?? PRIORITES[1]!
+
 const open = ref<Set<number>>(new Set())
 const affecter = ref<number | null>(null)
 const fermerAffecter = () => { affecter.value = null }
@@ -40,8 +54,7 @@ const totalJours = computed(() => (cahier.value?.taches ?? []).reduce((s: number
 const sansMembre = computed(() => (cahier.value?.taches ?? []).filter((t: any) => !(t.membre_ids ?? []).length))
 const nbDeps = computed(() => (cahier.value?.taches ?? []).reduce((s: number, t: any) => s + (t.depend_de?.length || 0), 0))
 const nbMembres = computed(() => new Set((cahier.value?.taches ?? []).flatMap((t: any) => t.membre_ids || [])).size)
-/** Nom de projet unique : contrôle immédiat (liste des projets connus) puis contrôle du serveur (CRM compris, source de vérité). */
-const cle = (x: string) => x.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase()
+/** Contrôle immédiat (liste des projets connus) puis contrôle du serveur (CRM compris, source de vérité). */
 const nomServeur = ref('')
 const nomPris = computed(() => {
   const k = cle(nom.value)
@@ -108,9 +121,9 @@ function pick(f?: File | null) {
   if (!EXT_OK.test(f.name)) { toast.err('Format non pris en charge.'); return }
   if (f.size > MAX_MO * 1024 * 1024) { toast.err(`Fichier trop volumineux (${MAX_MO} Mo max).`); return }
   fichier.value = f
+  // le nom du projet suit le fichier tant que l'utilisateur ne l'a pas saisi lui-même
   if (!nom.value || nomAuto.value) { nom.value = f.name.replace(/\.[^.]+$/, ''); nomAuto.value = true }
 }
-
 function retirerFichier() {
   fichier.value = null
   if (nomAuto.value) { nom.value = ''; nomAuto.value = false }
@@ -129,14 +142,14 @@ async function analyser() {
 function adopter() {
   if (analyse.erreur) { err.value = analyse.erreur; analyse.effacerErreur() }
   const c = analyse.reprendre()
-  if (c) { cahier.value = c; open.value = new Set([c.taches[0]?.id]) }
+  if (c) { cahier.value = normaliserCahier(c); open.value = new Set([c.taches[0]?.id]) }
   init()
 }
 watch(() => analyse.busy, (b) => { if (!b) adopter() })
 onMounted(() => { if (!analyse.busy) adopter() })
 
 async function reprendre(id: number) {
-  try { cahier.value = await api(`/cahiers/${id}`); bilan.value = null; open.value = new Set() } catch (e: any) { toast.err(e.message) }
+  try { cahier.value = normaliserCahier(await api(`/cahiers/${id}`)); bilan.value = null; open.value = new Set() } catch (e: any) { toast.err(e.message) }
 }
 const aSupprimer = ref<any>(null)
 async function supprimerEntree() {
@@ -153,7 +166,7 @@ async function abandonner() {
 }
 
 const save = (t: any) => put(`/taches/${t.id}`, {
-  titre: t.titre, description: t.description, priorite: t.priorite, duree_estimee: Math.max(1, Number(t.duree_estimee) || 1),
+  titre: t.titre, description: t.description, priorite: normPrio(t.priorite), duree_estimee: Math.max(1, Number(t.duree_estimee) || 1),
   membre_ids: t.membre_ids, depend_de: t.depend_de, criteres_acceptation: (t.criteres_acceptation ?? []).filter((c: string) => c.trim().length >= 5),
 }).catch((e: any) => toast.err(e.message))
 
@@ -167,7 +180,8 @@ async function remove(t: any) {
 }
 async function ajouter() {
   try {
-    const t = await post(`/cahiers/${cahier.value.id}/taches`, { titre: 'Nouvelle tâche', duree_estimee: 1 })
+    const t = await post(`/cahiers/${cahier.value.id}/taches`, { titre: 'Nouvelle tâche', duree_estimee: 1, priorite: 'secondaire' })
+    t.priorite = normPrio(t.priorite)
     cahier.value.taches.push(t); open.value.add(t.id)
   } catch (e: any) { toast.err(e.message) }
 }
@@ -270,7 +284,9 @@ const confiance = (c: number) => (c >= 0.7 ? 'bg-sky-400' : c >= 0.4 ? 'bg-purpl
       <div v-if="busy" class="relative px-6 py-12 text-center sm:px-10" role="status" aria-live="polite">
         <span class="relative mx-auto grid size-16 place-items-center rounded-2xl bg-gradient-to-br from-azur via-primary to-violet-arato text-white shadow-lg aura"><Icon name="sparkles" :size="28" class="floaty" /></span>
         <h2 class="display mt-5 text-2xl text-slate-900">L'agent analyse votre document</h2>
-        <p class="muted mt-1">Avec un modèle en ligne, comptez une à deux minutes. <span class="tabular-nums">{{ secondes }} s</span></p>
+        <p class="muted mt-1">
+          {{ estScan ? 'Les scans et images demandent une lecture du texte : comptez deux à quatre minutes.' : 'Avec un modèle en ligne, comptez une à deux minutes.' }}
+          <span class="tabular-nums">{{ secondes }} s</span></p>
         <ol class="mx-auto mt-7 max-w-sm space-y-3 text-left">
           <li v-for="(p, i) in PHASES" :key="p" class="flex items-center gap-3 text-sm transition-opacity duration-500" :class="i > phase ? 'opacity-40' : ''">
             <span class="grid size-6 shrink-0 place-items-center rounded-full text-white transition-colors duration-500"

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -76,18 +77,21 @@ def _docx(path: str) -> str:
 
 
 def _pptx_formes(formes, out: list) -> None:
-    """Texte des formes d'une diapositive (y compris groupes et tableaux)."""
+    """Texte des formes d'une diapositive (y compris groupes et tableaux). Une forme illisible est ignorée, jamais fatale."""
     for sh in formes:
-        if getattr(sh, "shapes", None) is not None and sh.shape_type == 6:      # 6 = groupe
-            _pptx_formes(sh.shapes, out)
-            continue
-        if getattr(sh, "has_text_frame", False) and sh.has_text_frame:
-            txt = sh.text_frame.text.strip()
-            if txt:
-                out.append(txt)
-        if getattr(sh, "has_table", False) and sh.has_table:
-            for row in sh.table.rows:
-                out.append(" | ".join(c.text for c in row.cells))
+        try:
+            if getattr(sh, "shapes", None) is not None:                          # groupe de formes
+                _pptx_formes(sh.shapes, out)
+                continue
+            if getattr(sh, "has_text_frame", False) and sh.has_text_frame:
+                txt = sh.text_frame.text.strip()
+                if txt:
+                    out.append(txt)
+            if getattr(sh, "has_table", False) and sh.has_table:
+                for row in sh.table.rows:
+                    out.append(" | ".join(c.text for c in row.cells))
+        except Exception:
+            log.warning("PowerPoint : une forme n'a pas pu être lue, elle est ignorée", exc_info=True)
 
 
 def _pptx(path: str) -> str:
@@ -96,10 +100,14 @@ def _pptx(path: str) -> str:
     for i, slide in enumerate(Presentation(path).slides, 1):
         out.append(f"--- Diapositive {i} ---")
         _pptx_formes(slide.shapes, out)
-        if slide.has_notes_slide:
-            notes = slide.notes_slide.notes_text_frame.text.strip()
-            if notes:
-                out.append("Notes : " + notes)
+        try:
+            if slide.has_notes_slide:
+                cadre = slide.notes_slide.notes_text_frame      # peut valoir None si la page de notes n'a pas de zone de texte
+                notes = cadre.text.strip() if cadre is not None else ""
+                if notes:
+                    out.append("Notes : " + notes)
+        except Exception:
+            log.warning("PowerPoint : notes de la diapositive %s illisibles", i, exc_info=True)
     return "\n".join(out)
 
 
@@ -323,7 +331,21 @@ def extract_text(path: str) -> str:
     ext = Path(path).suffix.lower()
     if ext not in EXT_OK:
         raise ExtractionError("Format non pris en charge.")
-    return clean_text(_extraire(path))
+    try:
+        return clean_text(_extraire(path))
+    except ExtractionError:
+        raise
+    except ImportError as e:            # module Python absent du serveur : message précis au lieu de « fichier illisible »
+        paquets = {"pptx": "python-pptx", "docx": "python-docx", "fitz": "pymupdf", "openpyxl": "openpyxl", "pypdf": "pypdf"}
+        nom = (e.name or "").split(".")[0]
+        log.error("Module manquant pour lire %s : %s", ext, e)
+        raise ExtractionError(f"Le serveur ne peut pas lire ce format : le module « {paquets.get(nom, nom)} » n'est pas installé "
+                              f"(pip install {paquets.get(nom, nom)}).")
+    except (zipfile.BadZipFile, KeyError):
+        if ext in EXT_OFFICE:           # un .pptx / .docx / .xlsx est une archive zip : sinon fichier corrompu ou ancien format renommé
+            raise ExtractionError(f"Ce fichier n'est pas un vrai {ext} (corrompu, ou ancien format simplement renommé). "
+                                  "Ouvrez-le dans Office et enregistrez-le de nouveau en " + ext + ".")
+        raise
 
 
 # ---------- Dépendances et cohérence ----------
@@ -351,6 +373,18 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip().lower()
 
 
+# Priorités : vocabulaire actuel « priorité / secondaire / bonus » ; l'ancien « haute / moyenne / basse » est converti.
+PRIORITES = ("priorité", "secondaire", "bonus")
+_PRIO_ALIAS = {"priorite": "priorité", "priorité": "priorité", "haute": "priorité", "high": "priorité",
+               "secondaire": "secondaire", "moyenne": "secondaire", "medium": "secondaire",
+               "bonus": "bonus", "basse": "bonus", "low": "bonus"}
+
+
+def normaliser_priorite(v) -> str | None:
+    """Ramène toute valeur connue (nouvelle ou ancienne, avec ou sans accent ou majuscule) à priorité / secondaire / bonus ; None si inconnue."""
+    return _PRIO_ALIAS.get(str(v or "").strip().lower())
+
+
 def check_coherence(taches: list[dict], texte_document: str) -> dict:
     """Doublons, manques, contradictions, fidélité au document."""
     problemes, doc = [], _norm(texte_document)
@@ -366,8 +400,8 @@ def check_coherence(taches: list[dict], texte_document: str) -> dict:
             problemes.append(f"Tâche {n} : durée estimée invalide (entier ≥ 1 jour)")
         elif t["duree_estimee_jours"] > 60:
             problemes.append(f"Tâche {n} : durée de {t['duree_estimee_jours']} jours, à découper")
-        if t.get("priorite") not in ("haute", "moyenne", "basse"):
-            problemes.append(f"Tâche {n} : priorité invalide (haute, moyenne ou basse)")
+        if normaliser_priorite(t.get("priorite")) is None:
+            problemes.append(f"Tâche {n} : priorité invalide (priorité, secondaire ou bonus)")
         src = _norm(t.get("source_dans_document", ""))
         if not src or src not in doc:
             problemes.append(f"Tâche {n} : source_dans_document absente ou non copiée à l'identique du document")

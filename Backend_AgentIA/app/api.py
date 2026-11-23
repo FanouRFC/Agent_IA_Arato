@@ -168,7 +168,9 @@ def tache_out(t: Tache) -> dict:
         "id", "ordre", "titre", "description", "priorite", "raison_priorite", "duree_estimee",
         "duree_proposee", "depend_de", "source_dans_document", "niveau_confiance", "profil_recommande", "ambiguites",
         "membre_ids", "statut_relecture", "origine", "id_ticket_crm")} | {
-        "echeance": t.date_echeance_initiale, "criteres_acceptation": list(t.criteres_acceptation or [])}
+        "echeance": t.date_echeance_initiale, "criteres_acceptation": list(t.criteres_acceptation or []),
+        # priorité toujours dans le vocabulaire actuel (priorité / secondaire / bonus), même pour d'anciennes lignes
+        "priorite": T.normaliser_priorite(t.priorite) or "secondaire"}
 
 
 def cahier_out(c: CahierDesCharges) -> dict:
@@ -184,10 +186,6 @@ def liste_cahiers(db: Session = Depends(get_db)):
              "date_depot": c.date_depot, "projet_id": c.projet_id,
              "nb_taches": len([t for t in c.taches if t.statut_relecture != "supprimee"])} for c in cs]
 
-EXT_TEXTE = {".txt", ".md", ".csv", ".json", ".html", ".htm", ".rtf"}
-EXT_IMAGE = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
-EXT_OK = EXT_TEXTE | EXT_IMAGE | {".pdf", ".docx", ".pptx", ".xlsx"}
-
 
 @router.post("/cahiers")
 def deposer_cahier(nom_projet: str = Form(...), texte: str = Form(""), fichier: Optional[UploadFile] = File(None),
@@ -196,13 +194,13 @@ def deposer_cahier(nom_projet: str = Form(...), texte: str = Form(""), fichier: 
     nom_projet = projects.nom_propre(nom_projet)
     if len(nom_projet) < 2:
         raise HTTPException(400, "Indiquez le nom du projet")
-    projects.verifier_nom_unique(db, nom_projet)
+    projects.verifier_nom_unique(db, nom_projet)          # jamais deux projets de même nom (refusé avant tout travail de l'agent)
     nom = "texte saisi"
     if fichier and fichier.filename:
         suffix = Path(fichier.filename).suffix.lower()
         if suffix not in T.EXT_OK:
             raise HTTPException(400, "Format non pris en charge (PDF, Word, PowerPoint, Excel, image, texte…)")
-        data = fichier.file.read(settings_max_bytes() + 1)
+        data = fichier.file.read(settings_max_bytes() + 1)      # jamais plus que la limite en mémoire
         if len(data) > settings_max_bytes():
             raise HTTPException(413, "Fichier trop volumineux")
         tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
@@ -211,9 +209,9 @@ def deposer_cahier(nom_projet: str = Form(...), texte: str = Form(""), fichier: 
                 tmp.write(data)
             texte, nom = T.extract_text(tmp.name), fichier.filename
         except T.ExtractionError as e:
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, str(e))          # message clair pour l'utilisateur
         except Exception:
-            log.exception("Extraction impossible pour %s", fichier.filename)
+            log.exception("Extraction impossible pour %s", fichier.filename)   # détail dans la console du serveur
             raise HTTPException(400, "Fichier illisible ou protégé")
         finally:
             os.unlink(tmp.name)
@@ -222,7 +220,6 @@ def deposer_cahier(nom_projet: str = Form(...), texte: str = Form(""), fichier: 
     if len(texte) < 30:
         raise HTTPException(400, "Aucun texte exploitable trouvé. Si c'est un scan ou une photo, "
                                  "vérifiez qu'il est net, bien orienté et assez grand.")
-    # ... le reste de la fonction est inchangé (ctx, agent.create_tasks, affectation, enregistrement)
     try:
         # Un nouveau projet repart de zéro : les tickets des autres projets ne sont jamais fournis à l'agent
         ctx = {"tickets": [], "membres": crm.membres(), "profils": crm.profils()}
@@ -243,7 +240,8 @@ def deposer_cahier(nom_projet: str = Form(...), texte: str = Form(""), fichier: 
         d = max(1, int(t["duree_estimee_jours"]))
         c.taches.append(Tache(
             ordre=t["id"], titre=t["titre"], description=t.get("description", ""),
-            criteres_acceptation=T.clean_criteria(t.get("criteres_acceptation")), priorite=t["priorite"],
+            criteres_acceptation=T.clean_criteria(t.get("criteres_acceptation")),
+            priorite=T.normaliser_priorite(t.get("priorite")) or "secondaire",      # l'ancien vocabulaire (haute/moyenne/basse) est converti
             raison_priorite=t.get("raison_priorite", ""), duree_estimee=d, duree_proposee=d,
             depend_de=t.get("depend_de") or [], source_dans_document=t.get("source_dans_document", ""),
             niveau_confiance=t["niveau_confiance"], profil_recommande=t.get("profil_recommande", ""),
@@ -263,7 +261,7 @@ class TacheIn(BaseModel):
     titre: Optional[str] = Field(None, max_length=300)
     description: Optional[str] = Field(None, max_length=5000)
     criteres_acceptation: Optional[list[str]] = Field(None, max_length=12)
-    priorite: Optional[str] = Field(None, pattern="^(haute|moyenne|basse)$")
+    priorite: Optional[str] = Field(None, pattern="^(priorité|secondaire|bonus)$")
     duree_estimee: Optional[int] = Field(None, ge=1, le=250)
     membre_ids: Optional[list[int]] = None
     depend_de: Optional[list[int]] = None
@@ -332,7 +330,7 @@ class NouvelleTache(BaseModel):
     titre: str = Field(min_length=2, max_length=300)
     description: str = Field("", max_length=5000)
     criteres_acceptation: list[str] = Field(default_factory=list, max_length=12)
-    priorite: str = Field("moyenne", pattern="^(haute|moyenne|basse)$")
+    priorite: str = Field("secondaire", pattern="^(priorité|secondaire|bonus)$")
     duree_estimee: int = Field(1, ge=1, le=250)
     membre_ids: list[int] = []
 
