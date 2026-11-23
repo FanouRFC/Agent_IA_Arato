@@ -11,7 +11,7 @@ TODAY = dt.date.today()
 
 
 def bd(d, n):
-    """Jours ouvrés (sans jours fériés dans le seed)."""
+    """Jours (sans jours fériés dans le seed)."""
     step = 1 if n >= 0 else -1
     k = abs(n)
     while k:
@@ -86,6 +86,7 @@ def main():
     db.add(HistoriqueStatut(ticket_id=o2.id, statut="ouvert", type_motif="retard",
                             motif="Environnement de test indisponible", auteur_id=membres[7].id, date=ago(1)))
     mk("Déploiement préproduction", 1, "en_cours", 75, 10, [7])               # normal
+    mk("Recette API commandes", 0, "en_cours", 100, 2, [4], desc="Avancement déclaré à 100 % : le statut reste « en cours » jusqu'à la clôture validée par le haut responsable")
     # Remplissage aléatoire
     titres = ["Authentification SSO", "Export PDF", "Tableau de bord KPI", "Notifications push", "Recherche avancée",
               "Gestion des rôles", "Migration des comptes", "Optimisation requêtes", "Documentation utilisateur",

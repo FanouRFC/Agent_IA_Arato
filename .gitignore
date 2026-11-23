@@ -1,6 +1,19 @@
+# Environnements et secrets (jamais dans Git) : seuls les .env.example sont versionnés
 venv/
 node_modules/
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
+.pytest_cache/
 dist/
+
+# Sauvegardes de bases de données (contiennent des empreintes de mots de passe et des données d'Arato)
+*.dump
+*.sql.gz
+*.bak
+
+# Données générées à l'exécution (e-mails archivés, photos de profil)
+Backend_AgentIA/data/
+CRM_AgentIA/data/

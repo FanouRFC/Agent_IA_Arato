@@ -2,7 +2,7 @@
 import datetime as dt
 from typing import Optional
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -11,9 +11,11 @@ from .db import Base
 class User(Base):
     __tablename__ = "utilisateurs"
     id: Mapped[int] = mapped_column(primary_key=True)
-    nom: Mapped[str] = mapped_column(String(80), unique=True)
+    email: Mapped[str] = mapped_column(String(254), unique=True)
     password_hash: Mapped[str] = mapped_column(String(200))
     role: Mapped[str] = mapped_column(String(30), default="haut_responsable")
+    actif: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    date_creation: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
 
 
 class Projet(Base):
@@ -21,14 +23,15 @@ class Projet(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     nom: Mapped[str] = mapped_column(String(200))
     date_limite: Mapped[Optional[dt.date]] = mapped_column(Date, nullable=True)
-    statut: Mapped[str] = mapped_column(String(30), default="en_preparation")
-    crm_projet_id: Mapped[Optional[int]] = mapped_column(nullable=True)
+    statut: Mapped[str] = mapped_column(String(30), default="actif")
+    crm_projet_id: Mapped[Optional[int]] = mapped_column(unique=True, nullable=True)
 
 
 class CahierDesCharges(Base):
     __tablename__ = "cahiers"
     id: Mapped[int] = mapped_column(primary_key=True)
-    projet_id: Mapped[int] = mapped_column(ForeignKey("projets.id"))
+    projet_id: Mapped[Optional[int]] = mapped_column(ForeignKey("projets.id"), unique=True, nullable=True)  # 1..1, créé à la validation
+    nom_projet: Mapped[str] = mapped_column(String(200), default="")
     nom_fichier: Mapped[str] = mapped_column(String(300), default="texte")
     texte: Mapped[str] = mapped_column(Text)
     date_depot: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
@@ -49,7 +52,7 @@ class Tache(Base):
     criteres_acceptation: Mapped[list] = mapped_column(JSON, default=list)
     priorite: Mapped[str] = mapped_column(String(10), default="moyenne")
     raison_priorite: Mapped[str] = mapped_column(Text, default="")
-    duree_estimee: Mapped[int] = mapped_column(Integer, default=1)   # jours ouvrés (validée / ajustée)
+    duree_estimee: Mapped[int] = mapped_column(Integer, default=1)   # en jours (validée / ajustée)
     duree_proposee: Mapped[int] = mapped_column(Integer, default=1)  # proposition initiale de l'agent
     date_echeance_initiale: Mapped[Optional[dt.date]] = mapped_column(Date, nullable=True)  # figée (trigger)
     depend_de: Mapped[list] = mapped_column(JSON, default=list)      # liste d'ordres de tâches
@@ -68,6 +71,7 @@ class Tache(Base):
 class SuiviRetard(Base):
     __tablename__ = "suivi_retard"
     id: Mapped[int] = mapped_column(primary_key=True)
+    id_projet: Mapped[int] = mapped_column(ForeignKey("projets.id"), index=True)
     id_ticket: Mapped[int] = mapped_column(Integer, index=True)
     date_calcul: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
     est_en_retard: Mapped[bool] = mapped_column(Boolean)
@@ -79,6 +83,7 @@ class SuiviRetard(Base):
 class AnalyseTicket(Base):
     __tablename__ = "analyses_ticket"
     id: Mapped[int] = mapped_column(primary_key=True)
+    id_projet: Mapped[int] = mapped_column(ForeignKey("projets.id"), index=True)
     id_ticket: Mapped[int] = mapped_column(Integer, index=True)
     date: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
     declencheur: Mapped[str] = mapped_column(String(200), default="")
@@ -88,6 +93,7 @@ class AnalyseTicket(Base):
 class SyntheseSuivi(Base):
     __tablename__ = "syntheses_suivi"
     id: Mapped[int] = mapped_column(primary_key=True)
+    id_projet: Mapped[int] = mapped_column(ForeignKey("projets.id"), index=True)
     date: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
     declencheur: Mapped[str] = mapped_column(String(200), default="")
     contenu: Mapped[str] = mapped_column(Text)
@@ -97,6 +103,7 @@ class SyntheseSuivi(Base):
 class Recommandation(Base):
     __tablename__ = "recommandations"
     id: Mapped[int] = mapped_column(primary_key=True)
+    id_projet: Mapped[int] = mapped_column(ForeignKey("projets.id"), index=True)
     id_ticket: Mapped[int] = mapped_column(Integer, index=True)
     date: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
     type: Mapped[str] = mapped_column(String(30), default="")
@@ -105,6 +112,7 @@ class Recommandation(Base):
     diagnostic: Mapped[str] = mapped_column(String(30), default="")
     source: Mapped[str] = mapped_column(String(10), default="llm")  # llm | fallback
     decision: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # suivie | rejetee
+    obsolete: Mapped[bool] = mapped_column(Boolean, default=False)  # remplacée par une recommandation plus récente
 
 
 class Notification(Base):
@@ -121,9 +129,12 @@ class Notification(Base):
 class ConversationChat(Base):
     __tablename__ = "conversations_chat"
     id: Mapped[int] = mapped_column(primary_key=True)
+    id_projet: Mapped[int] = mapped_column(ForeignKey("projets.id"), index=True)
     date: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
     question: Mapped[str] = mapped_column(Text)
     reponse: Mapped[str] = mapped_column(Text)
+    # Regroupe les échanges en discussions : l'historique des discussions précédentes reste consultable (NULL = ancien échange)
+    id_conversation: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
 
 
 class JournalAction(Base):
@@ -134,9 +145,21 @@ class JournalAction(Base):
     auteur: Mapped[str] = mapped_column(String(80), default="système")
 
 
+class ValidationCritere(Base):
+    """Case cochée d'un critère d'acceptation par le haut responsable (une ligne = un critère validé d'un ticket).
+    Rattachée au ticket CRM et au TEXTE du critère : aucune modification des tables existantes."""
+    __tablename__ = "validations_criteres"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    id_ticket: Mapped[int] = mapped_column(Integer, index=True)
+    critere: Mapped[str] = mapped_column(Text)
+    valide_par: Mapped[str] = mapped_column(String(254), default="")
+    date: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
+
+
 class Rapport(Base):
     __tablename__ = "rapports"
     id: Mapped[int] = mapped_column(primary_key=True)
+    id_projet: Mapped[int] = mapped_column(ForeignKey("projets.id"), index=True)
     date: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)
     format: Mapped[str] = mapped_column(String(10))
     contenu: Mapped[str] = mapped_column(Text, default="")

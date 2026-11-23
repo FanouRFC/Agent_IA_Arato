@@ -30,6 +30,7 @@ class CrmConnector:
     def profils(self): return self._get("/profils")
     def projets(self): return self._get("/projets")
     def evenements(self, since_id=0): return self._get("/evenements", since_id=since_id)
+    def dernier_evenement_id(self) -> int: return self._get("/evenements/dernier")["id"]
 
     # Écriture (uniquement après validation humaine, ou indicateur calculé par Python)
     def create_ticket(self, payload: dict):
@@ -37,8 +38,17 @@ class CrmConnector:
         r.raise_for_status()
         return r.json()
 
+    def create_projet(self, nom: str):
+        r = self.c.post("/projets", json={"nom": nom})
+        r.raise_for_status()
+        return r.json()
+
     def set_echeance(self, tid: int, d: dt.date): return self._put(f"/tickets/{tid}/echeance", {"echeance": str(d)})
     def set_est_en_retard(self, tid: int, v: bool): return self._put(f"/tickets/{tid}/est-en-retard", {"valeur": v})
+
+    def cloturer(self, tid: int, valide_par: str):
+        """Clôture : décision HUMAINE du haut responsable (jamais déclenchée par l'avancement, par Python ni par l'agent)."""
+        return self._put(f"/tickets/{tid}/cloture", {"valide_par": valide_par})
 
 
 connector = CrmConnector()

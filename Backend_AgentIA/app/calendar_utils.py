@@ -1,4 +1,4 @@
-"""Jours ouvrés (lundi-vendredi hors jours fériés configurables)."""
+"""Jours (lundi-vendredi hors jours fériés configurables)."""
 import datetime as dt
 
 
@@ -16,7 +16,7 @@ def add_bd(d: dt.date, n: int, holidays=frozenset()) -> dt.date:
 
 
 def bd_between(start: dt.date, end: dt.date, holidays=frozenset()) -> int:
-    """Nombre de jours ouvrés dans l'intervalle ]start, end]."""
+    """Nombre de jours dans l'intervalle ]start, end]."""
     n, d = 0, start
     while d < end:
         d += dt.timedelta(days=1)

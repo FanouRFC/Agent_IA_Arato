@@ -1,15 +1,14 @@
-import { fileURLToPath, URL } from 'node:url'
-import tailwindcss from "@tailwindcss/vite";
 
+import { fileURLToPath, URL } from 'node:url'
+import tailwindcss from '@tailwindcss/vite'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import vueDevTools from 'vite-plugin-vue-devtools'
 
-// https://vite.dev/config/
 export default defineConfig({
   plugins: [
     vue(),
-    vueDevTools(),
+    ...(process.env.NO_DEVTOOLS ? [] : [vueDevTools()]),
     tailwindcss(),
   ],
   resolve: {
@@ -18,9 +17,16 @@ export default defineConfig({
     },
   },
   server: {
-    // Les appels /api/... sont redirigés vers le backend FastAPI (port 8000)
     proxy: {
-      '/api': { target: 'http://localhost:8000', rewrite: (path) => path.replace(/^\/api/, '') },
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+      '/crm-api': {
+        target: 'http://127.0.0.1:8001',
+        rewrite: (path) => path.replace(/^\/crm-api/, ''),
+      },
     },
   },
 })
+

@@ -1,306 +1,325 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { api, fmtDate, SITUATION_CLASS, STATUT, tid } from '@/services/api'
+import { computed, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import { api, fmtDate, photoCrm, STATUT, tid } from '@/services/api'
+import { usePolling } from '@/composables/usePolling'
+import { useProjectStore } from '@/stores/project'
+import Avatar from '@/components/Avatar.vue'
+import EmptyState from '@/components/EmptyState.vue'
+import Icon from '@/components/Icon.vue'
+import StatutBadge from '@/components/StatutBadge.vue'
 
-type Cle = 'urgence' | 'ticket' | 'statut' | 'avancement'
-
-const PAGE = 20
-const SITUATIONS = [
-  { k: 'en_retard', l: 'En retard', dot: 'bg-brick' },
-  { k: 'a_surveiller', l: 'À surveiller', dot: 'bg-ochre' },
-  { k: 'normale', l: 'Dans les temps', dot: 'bg-teal' },
-]
-const ORDRE_SIT: Record<string, number> = { en_retard: 0, a_surveiller: 1, normale: 2, ferme: 3 }
-const BAR_SIT: Record<string, string> = { en_retard: 'bg-brick', a_surveiller: 'bg-ochre', normale: 'bg-teal', ferme: 'bg-ink/30' }
-const STATUT_ORDRE = Object.keys(STATUT)
-const COLS: { k: Cle | ''; l: string }[] = [
-  { k: 'ticket', l: 'Ticket' },
-  { k: 'statut', l: 'Statut CRM' },
-  { k: 'avancement', l: 'Avancement déclaré' },
-  { k: 'urgence', l: "État de l'échéance" },
-  { k: '', l: 'Motif documenté' },
-]
-const CHIP_ON = 'border-ink bg-ink text-white'
-const CHIP_OFF = 'border-line hover:border-ink/40'
-
-// ---------- État ----------
-const route = useRoute()
 const router = useRouter()
-const str = (v: unknown) => (typeof v === 'string' ? v : '')
-
-const rows = ref<any[]>([])
-const loading = ref(false)
-const err = ref('')
-const q = ref(str(route.query.q))
-const statut = ref(str(route.query.statut))
-const situation = ref(str(route.query.situation))
-const projet = ref(str(route.query.projet))
-const tri = ref<{ cle: Cle; dir: 1 | -1 }>({ cle: 'urgence', dir: 1 })
-const showAll = ref(false)
-const searchEl = ref<HTMLInputElement | null>(null)
+const onglet = ref<'frise' | 'avancement'>('frise')
+const project = useProjectStore()
+const d = ref<any>(null), err = ref(''), filtre = ref('tous'), q = ref('')
+const tri = ref<{ k: string; asc: boolean }>({ k: 'urgence', asc: true })
 
 async function load() {
-  loading.value = true
-  err.value = ''
-  try {
-    rows.value = await api('/dashboard')
-  } catch (e: any) {
-    err.value = e.message
-  } finally {
-    loading.value = false
-  }
+  if (!project.activeId) return
+  try { d.value = await api(`/projets/${project.activeId}/dashboard`); err.value = '' } catch (e: any) { err.value = e.message }
 }
+usePolling(load, 4000)
+watch(() => project.activeId, () => { d.value = null; filtre.value = 'tous'; q.value = ''; membreF.value = null; load() })
 
-function onKey(e: KeyboardEvent) {
-  const el = e.target as HTMLElement | null
-  const typing = !!el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable)
-  if (e.key === '/' && !typing && !e.ctrlKey && !e.metaKey) {
-    e.preventDefault()
-    searchEl.value?.focus()
+const stats = computed(() => d.value?.stats)
+const total = computed(() => stats.value?.total || 0)
+const rows = computed<any[]>(() => d.value?.tickets ?? [])
+const roster = computed<Record<number, any>>(() => Object.fromEntries((d.value?.membres ?? []).map((m: any) => [m.id, m])))
+
+// Palette : corail = retard, ambre = à surveiller, bleu acier = dans les délais, gris = terminées
+const segments = computed(() => {
+  const st = stats.value
+  if (!st) return []
+  const autres = st.total - st.en_retard - st.a_surveiller - st.par_statut.ferme
+  return [
+    { k: 'en_retard', label: 'En retard', value: st.en_retard, color: 'var(--nx-late)' },
+    { k: 'a_surveiller', label: 'À surveiller', value: st.a_surveiller, color: 'var(--nx-watch)' },
+    { k: 'normale', label: 'Dans les délais', value: Math.max(0, autres), color: 'var(--nx-ok)' },
+    { k: 'ferme', label: 'Terminées', value: st.par_statut.ferme, color: 'var(--nx-done)' },
+  ]
+})
+const sante = computed(() => (total.value ? Math.round(((total.value - (stats.value?.en_retard ?? 0) - (stats.value?.a_surveiller ?? 0)) / total.value) * 100) : 0))
+const verdict = computed(() => (sante.value >= 80 ? 'Le projet est sous contrôle' : sante.value >= 50 ? 'Le projet demande de l\'attention' : 'Le projet est en difficulté'))
+const survol = ref('')
+const jour = (d: Date) => d.toLocaleDateString('sv-SE')
+/** Échéances des 14 prochains jours (tickets non fermés) : une colonne par jour, les retards à part. */
+const agenda = computed(() => {
+  const auj = new Date(); auj.setHours(0, 0, 0, 0)
+  const jours = Array.from({ length: 14 }, (_, i) => { const x = new Date(auj); x.setDate(auj.getDate() + i); return x })
+  const ouverts = rows.value.filter((r) => r.statut !== 'ferme')
+  const cols = jours.map((x) => ({ d: x, n: ouverts.filter((r) => String(r.echeance).slice(0, 10) === jour(x)).length }))
+  const max = Math.max(1, ...cols.map((c) => c.n))
+  const prochains = ouverts.filter((r) => String(r.echeance).slice(0, 10) >= jour(auj)).sort((a, b) => cmp(a.echeance, b.echeance)).slice(0, 5)
+  return { cols, max, prochains, retards: ouverts.filter((r) => String(r.echeance).slice(0, 10) < jour(auj)).length }
+})
+const lettre = (d: Date) => d.toLocaleDateString('fr-FR', { weekday: 'narrow' }).toUpperCase()
+const mois = (iso: string) => new Date(iso).toLocaleDateString('fr-FR', { month: 'short' }).replace('.', '')
+const jourNum = (iso: string) => new Date(iso).getDate()
+// Jauge de santé (affichage) : un arc par situation, proportionnel au nombre de tickets ; l'aiguille indique le % sans alerte
+const arcs = computed(() => {
+  let cumul = 0
+  return segments.value.filter((g) => g.value).map((g) => {
+    const part = total.value ? (g.value / total.value) * 100 : 0
+    const out = { ...g, start: cumul, len: Math.max(0, part - 1.2) }
+    cumul += part
+    return out
+  })
+})
+/** Frise : tickets non terminés rangés par jour d'échéance (14 jours) ; les retards forment la première colonne. */
+const frise = computed(() => {
+  const auj = new Date(); auj.setHours(0, 0, 0, 0)
+  const ouverts = rows.value.filter((r) => r.statut !== 'ferme')
+  const cols = Array.from({ length: 14 }, (_, i) => { const x = new Date(auj); x.setDate(auj.getDate() + i); return { d: x, we: x.getDay() === 0 || x.getDay() === 6, items: ouverts.filter((r) => String(r.echeance).slice(0, 10) === jour(x)) } })
+  const retards = ouverts.filter((r) => String(r.echeance).slice(0, 10) < jour(auj))
+  return { cols, retards, total: retards.length + cols.reduce((n, c) => n + c.items.length, 0) }
+})
+// Avancement déclaré des tickets en cours (l'avancement n'apparaît plus dans le tableau : il est ici)
+const avancements = computed(() => rows.value.filter((r) => r.statut !== 'ferme')
+  .sort((a, b) => b.avancement_declare - a.avancement_declare).slice(0, 6)
+  .map((r) => ({ label: `${tid(r.id)} · ${r.titre}`, value: r.avancement_declare, color: r.situation === 'en_retard' ? 'var(--nx-late)' : 'var(--nx-ok)', hint: r.etat_echeance })))
+
+// Charge par membre : tickets non fermés. Jauge circulaire fine + badge de charge (légère / modérée / élevée).
+const CAPACITE = 6
+const niveau = (n: number) => (n >= 5 ? { l: 'Élevée', cls: 'badge-red' } : n >= 3 ? { l: 'Modérée', cls: 'badge-amber' } : { l: 'Légère', cls: 'badge-slate' })
+const ABREGE: Record<string, string> = { nouveau: 'Nouv.', ouvert: 'Ouv.', en_cours: 'Cours', en_attente: 'Att.', retard: 'Ret.' }
+const COLS_CHARGE = [
+  { k: 'nouveau', l: 'Nouveau' }, { k: 'ouvert', l: 'Ouvert' }, { k: 'en_cours', l: 'En cours' }, { k: 'en_attente', l: 'En attente' }, { k: 'retard', l: 'En retard' },
+]
+const membreF = ref<number | null>(null)
+/** Matrice membre × statut : chaque case compte les tickets non terminés ; la dernière colonne compte les retards. */
+const charge = computed(() => {
+  const m = new Map<number, { n: number; late: number; par: Record<string, number> }>()
+  for (const r of rows.value) {
+    if (r.statut === 'ferme') continue
+    for (const id of r.membre_ids ?? []) {
+      const x = m.get(id) ?? { n: 0, late: 0, par: {} }
+      x.n++; x.par[r.statut] = (x.par[r.statut] ?? 0) + 1
+      if (r.situation === 'en_retard') { x.late++; x.par.retard = (x.par.retard ?? 0) + 1 }
+      m.set(id, x)
+    }
   }
-}
-onMounted(() => { load(); window.addEventListener('keydown', onKey) })
-onUnmounted(() => window.removeEventListener('keydown', onKey))
-
-// Les filtres restent dans l'adresse : la page se retrouve identique après un retour ou un rechargement
-watch([q, statut, situation, projet], () => {
-  showAll.value = false
-  router.replace({
-    query: {
-      ...route.query,
-      q: q.value || undefined,
-      statut: statut.value || undefined,
-      situation: situation.value || undefined,
-      projet: projet.value || undefined,
-    },
+  return [...m.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 8).map(([id, x]) => {
+    const mb = roster.value[id]
+    return { id, nom: mb?.nom ?? 'Membre', photo: photoCrm(mb?.photo), ...x, niv: niveau(x.n) }
   })
 })
 
-// ---------- Recherche ----------
-const norm = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-const tokens = computed(() => norm(q.value).split(/\s+/).filter(Boolean))
+const maxCase = computed(() => Math.max(1, ...charge.value.flatMap((c) => COLS_CHARGE.map((k) => c.par[k.k] ?? 0))))
+const intensite = (n: number) => ({ '--t': (0.14 + 0.66 * (n / maxCase.value)).toFixed(2) })
+const fort = (n: number) => n / maxCase.value > 0.5
+const filtreActif = computed(() => filtre.value !== 'tous' || !!q.value.trim() || membreF.value !== null)
+function reinitialiser() { filtre.value = 'tous'; q.value = ''; membreF.value = null }
+const filtreNom = computed(() => (membreF.value === null ? '' : roster.value[membreF.value]?.nom ?? ''))
+const count = (f: string) => rows.value.filter((r) => match(r, f)).length
+function match(r: any, f: string) {
+  if (membreF.value !== null && !(r.membre_ids ?? []).includes(membreF.value)) return false
+  if (f === 'tous') return true
+  if (f === 'en_retard' || f === 'a_surveiller') return r.situation === f
+  return r.statut === f
+}
+const FILTRES = [
+  { k: 'tous', l: 'Tous' }, { k: 'nouveau', l: STATUT.nouveau }, { k: 'ouvert', l: STATUT.ouvert }, { k: 'en_cours', l: STATUT.en_cours },
+  { k: 'en_attente', l: STATUT.en_attente }, { k: 'ferme', l: STATUT.ferme }, { k: 'en_retard', l: 'En retard' }, { k: 'a_surveiller', l: 'À surveiller' },
+]
 
-function haystack(r: any) {
-  return norm([tid(r.id), r.titre, r.projet, r.motif, r.etat_echeance, STATUT[r.statut]].filter(Boolean).join(' '))
-}
-function matchToken(r: any, tok: string) {
-  // « t-14 », « T014 » ou « #14 » retrouvent le ticket T-014
-  const m = tok.match(/^(?:t-?|#)0*(\d+)$/)
-  if (m && Number(m[1]) === r.id) return true
-  return haystack(r).includes(tok)
-}
-const matchQuery = (r: any) => tokens.value.every(t => matchToken(r, t))
-
-function parts(text: string | null | undefined) {
-  const t = text ?? ''
-  const toks = tokens.value.filter(x => x.length > 1)
-  const n = norm(t)
-  if (!t || !toks.length || n.length !== t.length) return [{ t, hit: false }]
-  const re = new RegExp('(' + toks.map(escapeRe).join('|') + ')', 'g')
-  const out: { t: string; hit: boolean }[] = []
-  let last = 0
-  for (const m of n.matchAll(re)) {
-    const i = m.index ?? 0
-    if (i > last) out.push({ t: t.slice(last, i), hit: false })
-    out.push({ t: t.slice(i, i + m[0].length), hit: true })
-    last = i + m[0].length
-  }
-  if (last < t.length) out.push({ t: t.slice(last), hit: false })
-  return out
-}
-
-// ---------- Filtres ----------
-function pass(r: any, skip?: 'statut' | 'situation' | 'projet') {
-  return (skip === 'statut' || !statut.value || r.statut === statut.value)
-    && (skip === 'situation' || !situation.value || r.situation === situation.value)
-    && (skip === 'projet' || !projet.value || r.projet === projet.value)
-    && matchQuery(r)
-}
-// Les compteurs tiennent compte de la recherche et des autres filtres
-const countStatut = (s: string) => rows.value.filter(r => pass(r, 'statut') && r.statut === s).length
-const countSituation = (s: string) => rows.value.filter(r => pass(r, 'situation') && r.situation === s).length
-const projets = computed(() => [...new Set(rows.value.map(r => r.projet).filter(Boolean))].sort() as string[])
-const filtresActifs = computed(() => !!(q.value || statut.value || situation.value || projet.value))
-function reinitialiser() {
-  q.value = ''
-  statut.value = ''
-  situation.value = ''
-  projet.value = ''
-}
-
-// ---------- Tri ----------
-function trier(cle: Cle) {
-  tri.value = tri.value.cle === cle ? { cle, dir: tri.value.dir === 1 ? -1 : 1 } : { cle, dir: 1 }
-}
-const fleche = (cle: string) => (tri.value.cle === cle ? (tri.value.dir === 1 ? '▲' : '▼') : '')
-const ariaSort = (cle: string) =>
-  tri.value.cle === cle ? (tri.value.dir === 1 ? 'ascending' : 'descending') : 'none'
-
-const filtered = computed(() => rows.value.filter(r => pass(r)))
-const sorted = computed(() => {
-  const { cle, dir } = tri.value
-  const num = (r: any): number =>
-    cle === 'ticket' ? r.id
-      : cle === 'statut' ? STATUT_ORDRE.indexOf(r.statut)
-      : cle === 'avancement' ? Number(r.avancement_declare) || 0
-      : ORDRE_SIT[r.situation] ?? 9
-  const date = (r: any): string => r.echeance ?? '9999-12-31'
-  return [...filtered.value].sort((a, b) => (num(a) - num(b)) * dir || date(a).localeCompare(date(b)) || a.id - b.id)
+// Tri : par défaut, les tickets les plus urgents en premier (retard, à surveiller, puis échéance)
+const ORDRE_SITUATION: Record<string, number> = { en_retard: 0, a_surveiller: 1, normale: 2, ferme: 3 }
+const valeurTri = (r: any, k: string) =>
+  k === 'urgence' ? (ORDRE_SITUATION[r.situation] ?? 9) : k === 'titre' ? r.titre.toLowerCase() : k === 'statut' ? r.statut : k === 'avancement' ? r.avancement_declare : r.echeance
+const cmp = (a: any, b: any) => (a < b ? -1 : a > b ? 1 : 0)
+const shown = computed(() => {
+  const needle = q.value.trim().toLowerCase()
+  const list = rows.value.filter((r) => match(r, filtre.value) && (!needle || (tid(r.id) + ' ' + r.titre).toLowerCase().includes(needle)))
+  const { k, asc } = tri.value
+  return [...list].sort((a, b) => {
+    let c = cmp(valeurTri(a, k), valeurTri(b, k))
+    if (c === 0) c = cmp(a.echeance, b.echeance)
+    return asc ? c : -c
+  })
 })
-const visibles = computed(() => (showAll.value ? sorted.value : sorted.value.slice(0, PAGE)))
+function trier(k: string) { tri.value = { k, asc: tri.value.k === k ? !tri.value.asc : true } }
+const fleche = (k: string) => (tri.value.k === k ? (tri.value.asc ? '↑' : '↓') : '')
+const ariaSort = (k: string) => (tri.value.k === k ? (tri.value.asc ? 'ascending' : 'descending') : 'none')
+// Colonnes : statut CRM, état de l'échéance (calculé par Python) et avancement déclaré par le membre.
+const COLS = [{ k: 'titre', l: 'Ticket' }, { k: 'statut', l: 'Statut' }, { k: 'urgence', l: "État de l'échéance" }, { k: 'avancement', l: 'Avancement' }]
+const accentLigne = (r: any) => (r.situation === 'en_retard' ? 'var(--nx-late)' : r.situation === 'a_surveiller' ? 'var(--nx-watch)' : r.situation === 'ferme' ? 'var(--nx-line-3)' : 'var(--nx-ok)')
+const equipe = (r: any) => (r.membre_ids ?? []).map((id: number) => roster.value[id]).filter(Boolean)
 </script>
 
+
 <template>
-  <div class="flex flex-wrap items-end gap-3">
-    <div>
-      <h1 class="text-2xl font-semibold">Tableau de bord</h1>
-      <p class="mt-1 text-sm text-ink/70">
-        Le statut CRM, l'avancement déclaré et l'état de l'échéance sont trois informations distinctes.
-      </p>
-    </div>
-    <button class="btn-quiet ml-auto" :disabled="loading" @click="load">
-      {{ loading ? 'Actualisation…' : 'Actualiser' }}
-    </button>
-  </div>
+  <div class="nx">
+    <header class="nx-head nx-in">
+      <div class="min-w-0 flex-1">
+        <p class="nx-eyebrow mb-2">Suivi · {{ d ? d.projet.nom : 'Projet' }}</p>
+        <h1>Tableau de bord</h1>
+        <p>{{ d ? `${d.stats.total} tickets suivis en direct` : 'Suivi rapide des tickets du projet' }}</p>
+      </div>
+    </header>
 
-  <div v-if="err" class="panel mt-4 flex flex-wrap items-center gap-3 border-l-4 border-l-brick" role="alert">
-    <p class="flex-1 text-sm text-brick">{{ err }}</p>
-    <button class="btn-quiet" @click="load">Réessayer</button>
-  </div>
+    <p v-if="err" class="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{{ err }}</p>
 
-  <!-- Recherche -->
-  <div class="relative mt-5 max-w-2xl">
-    <svg class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink/50" viewBox="0 0 24 24"
-         fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-      <circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" />
-    </svg>
-    <input ref="searchEl" v-model="q" type="text" autocomplete="off" class="field pl-9! pr-10!"
-           placeholder="Rechercher un ticket (T-014), un titre, un projet, un motif…" aria-label="Rechercher un ticket"
-           @keydown.esc="q = ''" />
-    <button v-if="q" type="button" class="absolute right-2 top-1/2 grid h-7 w-7 -translate-y-1/2 place-items-center rounded text-ink/60 hover:bg-line/50"
-            aria-label="Effacer la recherche" @click="q = ''; searchEl?.focus()">✕</button>
-    <kbd v-else class="pointer-events-none absolute right-3 top-1/2 hidden -translate-y-1/2 rounded border border-line px-1.5 text-xs text-ink/50 sm:block"
-         aria-hidden="true">/</kbd>
-  </div>
-
-  <!-- Filtres -->
-  <div class="mt-4 flex flex-wrap items-center gap-x-6 gap-y-3 text-sm">
-    <div class="flex flex-wrap items-center gap-2" role="group" aria-label="Filtrer par statut CRM">
-      <span class="text-ink/60">Statut</span>
-      <button v-for="s in STATUT_ORDRE" :key="s" type="button" class="rounded-full border px-3 py-1 transition"
-              :class="statut === s ? CHIP_ON : CHIP_OFF" :aria-pressed="statut === s"
-              @click="statut = statut === s ? '' : s">
-        {{ STATUT[s] }} <span class="tabular-nums opacity-70">{{ countStatut(s) }}</span>
-      </button>
+    <div v-if="!d && !err" class="nx-dash" aria-busy="true">
+      <div class="nx-skel nx-s7" style="height: 22rem" /><div class="nx-skel nx-s5" style="height: 22rem" />
     </div>
 
-    <div class="flex flex-wrap items-center gap-2" role="group" aria-label="Filtrer par état de l'échéance">
-      <span class="text-ink/60">Échéance</span>
-      <button v-for="s in SITUATIONS" :key="s.k" type="button"
-              class="flex items-center gap-1.5 rounded-full border px-3 py-1 transition"
-              :class="situation === s.k ? CHIP_ON : CHIP_OFF" :aria-pressed="situation === s.k"
-              @click="situation = situation === s.k ? '' : s.k">
-        <span class="h-2 w-2 rounded-full" :class="s.dot" aria-hidden="true"></span>
-        {{ s.l }} <span class="tabular-nums opacity-70">{{ countSituation(s.k) }}</span>
-      </button>
-    </div>
-
-    <label v-if="projets.length > 1" class="flex items-center gap-2">
-      <span class="text-ink/60">Projet</span>
-      <select v-model="projet" class="field w-auto! py-1!">
-        <option value="">Tous</option>
-        <option v-for="p in projets" :key="p" :value="p">{{ p }}</option>
-      </select>
-    </label>
-
-    <button v-if="filtresActifs" type="button" class="text-teal hover:underline" @click="reinitialiser">
-      Réinitialiser
-    </button>
-  </div>
-
-  <p class="mt-4 text-sm text-ink/60" aria-live="polite">
-    <template v-if="rows.length">
-      {{ filtered.length }} ticket{{ filtered.length > 1 ? 's' : '' }}
-      <template v-if="filtered.length !== rows.length">sur {{ rows.length }}</template>
-    </template>
-  </p>
-
-  <!-- Tableau -->
-  <div class="panel mt-2 overflow-x-auto p-0!">
-    <table class="w-full min-w-[46rem] text-left text-sm">
-      <thead class="border-b border-line bg-paper">
-        <tr>
-          <th v-for="c in COLS" :key="c.l" class="p-3" scope="col" :aria-sort="c.k ? ariaSort(c.k) : undefined">
-            <button v-if="c.k" type="button" class="inline-flex items-center gap-1 font-semibold hover:text-teal"
-                    @click="trier(c.k)">
-              {{ c.l }}<span class="w-3 text-xs" aria-hidden="true">{{ fleche(c.k) }}</span>
+    <div v-if="d" class="nx-dash">
+      <!-- NIVEAU 1 · l'état du projet (bloc signature) + la charge de l'équipe juste à côté -->
+      <h2 class="nx-niveau nx-s12"><span>1</span>Vue d'ensemble<small>État du projet et charge de l'équipe</small></h2>
+      <section class="nx-hero nx-s7 nx-in" style="--i: 1" aria-label="État du projet">
+        <p class="nx-hero-top"><span class="nx-live" aria-hidden="true" />État du projet · en direct</p>
+        <div class="nx-hero-grid">
+          <div class="nx-gauge">
+            <div class="nx-gauge-ring">
+            <svg viewBox="0 0 200 200" role="img" :aria-label="`Santé du projet : ${sante} %. ${segments.map((g) => `${g.value} ${g.label}`).join(', ')}`">
+              <circle cx="100" cy="100" r="82" pathLength="100" class="g-fond" />
+              <circle v-for="g in arcs" :key="g.k" cx="100" cy="100" r="82" pathLength="100" class="g-arc" transform="rotate(-90 100 100)"
+                :style="{ stroke: g.color, strokeDasharray: `${Math.max(0.5, g.len - 2.2)} ${100 - Math.max(0.5, g.len - 2.2)}`, strokeDashoffset: -(g.start + 1.1), opacity: survol && survol !== g.k ? .2 : 1 }"
+                @mouseenter="survol = g.k" @mouseleave="survol = ''" />
+            </svg>
+            <div class="nx-gauge-c"><p class="nx-num">{{ sante }}<span>%</span></p></div>
+            </div>
+            <p class="nx-verdict">{{ verdict }}</p>
+            <p class="nx-verdict-s">{{ total - stats.en_retard - stats.a_surveiller }} des {{ total }} tickets sans alerte</p>
+          </div>
+          <div class="nx-kpis">
+            <button v-for="k in [
+              { f: 'en_retard', l: 'En retard', v: stats.en_retard, n: stats.en_retard, i: 'alert', c: 'var(--nx-late)', t: 'Priorité' },
+              { f: 'a_surveiller', l: 'À surveiller', v: stats.a_surveiller, n: stats.a_surveiller, i: 'clock', c: 'var(--nx-watch)', t: 'Proche' },
+              { f: 'en_attente', l: 'En attente', v: stats.par_statut.en_attente, n: stats.par_statut.en_attente, i: 'lock', c: '#C3CDDC', t: 'Bloquées' },
+              { f: 'ferme', l: 'Terminées', v: `${stats.par_statut.ferme}`, n: stats.par_statut.ferme, i: 'check', c: 'var(--nx-done)', t: `sur ${stats.total}` },
+            ]" :key="k.f" type="button" class="nx-kpi" :class="filtre === k.f && 'is-on'" :aria-pressed="filtre === k.f"
+              @click="filtre = filtre === k.f ? 'tous' : k.f" @mouseenter="survol = k.f === 'ferme' ? 'ferme' : k.f" @mouseleave="survol = ''">
+              <Icon :name="k.i" :size="16" class="nx-kpi-ico" />
+              <span class="nx-kpi-l"><i :style="{ background: k.c }" />{{ k.l }}</span>
+              <span class="nx-kpi-v nx-num">{{ k.v }}</span>
+              <span class="nx-kpi-p">{{ k.t }} · {{ total ? Math.round((k.n / total) * 100) : 0 }} %</span>
             </button>
-            <template v-else>{{ c.l }}</template>
-          </th>
-        </tr>
-      </thead>
-      <tbody>
-        <!-- Chargement -->
-        <template v-if="loading && !rows.length">
-          <tr v-for="i in 5" :key="i" class="border-b border-line/60" aria-hidden="true">
-            <td v-for="j in 5" :key="j" class="p-3"><div class="h-4 animate-pulse rounded bg-line/60"></div></td>
-          </tr>
-        </template>
+          </div>
+        </div>
+        <div class="nx-seg" role="img" :aria-label="segments.map((g) => `${g.value} ${g.label}`).join(', ')">
+          <button v-for="g in segments.filter((x) => x.value)" :key="g.k" type="button" :style="{ flexGrow: g.value, background: g.color, opacity: survol && survol !== g.k ? .3 : 1 }"
+            :title="`${g.value} ${g.label} · cliquer pour filtrer`" @mouseenter="survol = g.k" @mouseleave="survol = ''" @click="filtre = g.k === 'normale' ? 'tous' : g.k">{{ g.value }}</button>
+        </div>
+        <dl class="nx-hero-rep">
+          <div><dt><Icon name="calendar" :size="13" /> Échéance finale</dt><dd>{{ d.projet.date_limite ? fmtDate(d.projet.date_limite) : '—' }}</dd></div>
+          <div><dt><Icon name="clock" :size="13" /> Prochaine échéance</dt><dd>{{ agenda.prochains[0] ? `${tid(agenda.prochains[0].id)} · ${fmtDate(agenda.prochains[0].echeance)}` : 'Aucune' }}</dd></div>
+          <div :class="agenda.retards > 0 && 'is-alert'"><dt><Icon name="alert" :size="13" /> Déjà en retard</dt><dd>{{ agenda.retards }} ticket{{ agenda.retards > 1 ? 's' : '' }}</dd></div>
+        </dl>
+      </section>
 
-        <tr v-for="r in visibles" :key="r.id" class="border-b border-line/60 align-top transition hover:bg-line/20">
-          <td class="p-3">
-            <router-link :to="`/tickets/${r.id}`" class="font-medium text-teal underline">{{ tid(r.id) }}</router-link>
-            <span v-if="r.projet" class="ml-2 text-xs text-ink/50">{{ r.projet }}</span>
-            <div class="mt-0.5 max-w-xs text-sm text-ink/80">
-              <template v-for="(p, i) in parts(r.titre)" :key="i">
-                <mark v-if="p.hit" class="rounded bg-ochre-soft px-0.5 text-inherit">{{ p.t }}</mark>
-                <template v-else>{{ p.t }}</template>
-              </template>
-            </div>
-          </td>
-          <td class="p-3"><span class="tag bg-line/60 text-ink/80">{{ STATUT[r.statut] ?? r.statut }}</span></td>
-          <td class="p-3">
-            <div class="flex items-center gap-2">
-              <span class="h-1.5 w-20 overflow-hidden rounded-full bg-line" aria-hidden="true">
-                <span class="block h-full rounded-full" :class="BAR_SIT[r.situation] ?? 'bg-teal'"
-                      :style="{ width: Math.min(100, Math.max(0, Number(r.avancement_declare) || 0)) + '%' }"></span>
-              </span>
-              <span class="tabular-nums">{{ r.avancement_declare }} %</span>
-            </div>
-          </td>
-          <td class="p-3">
-            <span class="tag" :class="SITUATION_CLASS[r.situation]">{{ r.etat_echeance }}</span>
-            <div class="mt-1 text-xs text-ink/60">échéance {{ fmtDate(r.echeance) }}</div>
-          </td>
-          <td class="p-3">
-            <template v-if="r.motif">
-              <template v-for="(p, i) in parts(r.motif)" :key="i">
-                <mark v-if="p.hit" class="rounded bg-ochre-soft px-0.5 text-inherit">{{ p.t }}</mark>
-                <template v-else>{{ p.t }}</template>
-              </template>
-            </template>
-            <span v-else-if="r.situation === 'en_retard'" class="italic text-ochre">Aucun motif documenté</span>
-            <span v-else class="text-ink/40">—</span>
-          </td>
-        </tr>
+      <!-- Charge par membre : matrice membre × statut (diagramme de la version 34), voisine du bloc principal -->
+      <section class="nx-card nx-card-p nx-s5 nx-in" style="--i: 2">
+        <header class="nx-card-h"><span class="nx-ico"><Icon name="users" :size="17" /></span><div><h2>Charge par membre</h2><p>Tickets non terminés, par membre et par statut</p></div></header>
+        <div v-if="charge.length">
+          <table class="nx-heat" aria-label="Charge par membre et par statut">
+            <colgroup><col style="width: 8.4rem"><col v-for="k in COLS_CHARGE" :key="k.k"><col style="width: 4.8rem"></colgroup>
+            <thead><tr><th /><th v-for="k in COLS_CHARGE" :key="k.k" scope="col" :class="k.k === 'retard' && 'late'">{{ ABREGE[k.k] }}</th><th scope="col">Charge</th></tr></thead>
+            <tbody>
+              <tr v-for="c in charge" :key="c.id" :class="membreF === c.id && 'is-on'" :title="`${c.nom} : ${c.n} ticket(s) non terminé(s) · cliquer pour filtrer le tableau`" @click="membreF = membreF === c.id ? null : c.id">
+                <th scope="row"><span class="who"><Avatar :nom="c.nom" :src="c.photo" :size="26" /><span>{{ c.nom }}</span></span></th>
+                <td v-for="k in COLS_CHARGE" :key="k.k" class="c" :class="c.par[k.k] ? ['v', k.k === 'retard' && 'late', fort(c.par[k.k] ?? 0) && 'fort'] : 'z'" :style="c.par[k.k] ? intensite(c.par[k.k] ?? 0) : undefined">{{ c.par[k.k] || '·' }}</td>
+                <td><span class="badge" :class="c.niv.cls">{{ c.niv.l }}</span></td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="nx-heat-note"><i />plus la case est foncée, plus la charge est forte · cliquer sur un membre filtre le tableau</p>
+        </div>
+        <p v-else class="text-sm text-slate-500">Aucun ticket affecté.</p>
+      </section>
 
-        <tr v-if="!loading && !visibles.length">
-          <td colspan="5" class="p-8 text-center">
-            <template v-if="rows.length">
-              <p class="text-ink/70">Aucun ticket ne correspond à votre recherche.</p>
-              <button class="btn-quiet mt-3" @click="reinitialiser">Réinitialiser les filtres</button>
-            </template>
-            <p v-else class="text-ink/60">Aucun ticket pour l'instant.</p>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+      <!-- NIVEAU 2 · les échéances : frise ou avancement (onglets), et la liste des prochaines -->
+      <h2 v-if="total" class="nx-niveau nx-s12"><span>2</span>Échéances<small>Ce qui arrive et où en sont les tickets</small></h2>
+      <section v-if="total" class="nx-card nx-card-p nx-s7 nx-in" style="--i: 3">
+        <header class="nx-card-h">
+          <span class="nx-ico"><Icon :name="onglet === 'frise' ? 'calendar' : 'trending'" :size="17" /></span>
+          <div><h2>{{ onglet === 'frise' ? 'Frise des 14 prochains jours' : 'Avancement déclaré' }}</h2>
+            <p>{{ onglet === 'frise' ? 'Une pastille = un ticket non terminé · cliquer pour ouvrir' : 'Tickets non terminés, du plus avancé au moins avancé' }}</p></div>
+          <div class="nx-tabs ml-auto" role="tablist" aria-label="Type de vue">
+            <button type="button" role="tab" class="nx-tab" :aria-selected="onglet === 'frise'" @click="onglet = 'frise'">Échéances <b>{{ frise.total }}</b></button>
+            <button type="button" role="tab" class="nx-tab" :aria-selected="onglet === 'avancement'" @click="onglet = 'avancement'">Avancement</button>
+          </div>
+        </header>
+        <div v-if="onglet === 'frise'" class="nx-frise" role="group" aria-label="Frise des échéances">
+          <div class="nx-fr-col is-late"><div class="nx-fr-pile"><button v-for="r in frise.retards" :key="r.id" type="button" class="nx-pin is-late" :title="`${tid(r.id)} · ${r.titre} (en retard)`" @click="router.push(`/tickets/${r.id}`)">{{ tid(r.id).replace('T-', '') }}</button></div>
+            <span class="nx-fr-lab nx-fr-lab-late">RETARD</span></div>
+          <div v-for="(c, i) in frise.cols" :key="i" class="nx-fr-col" :class="[i === 0 && 'is-today', c.we && 'is-we']">
+            <div class="nx-fr-pile"><button v-for="r in c.items" :key="r.id" type="button" class="nx-pin" :class="r.situation === 'a_surveiller' && 'is-watch'" :title="`${tid(r.id)} · ${r.titre}`" @click="router.push(`/tickets/${r.id}`)">{{ tid(r.id).replace('T-', '') }}</button></div>
+            <span class="nx-fr-lab">{{ i === 0 ? 'AUJ.' : lettre(c.d) }}<em>{{ c.d.getDate() }}</em></span>
+          </div>
+        </div>
+        <ul v-else-if="avancements.length" class="nx-av">
+          <li v-for="a in avancements" :key="a.label"><span class="truncate" :title="a.label">{{ a.label }}</span><b>{{ a.value }} %</b>
+            <div class="nx-av-t"><i :style="{ width: a.value + '%', background: a.color }" /></div></li>
+        </ul>
+        <p v-else class="text-sm text-slate-500">Aucun ticket en cours.</p>
+      </section>
+
+      <section v-if="total" class="nx-card nx-card-p nx-s5 nx-in" style="--i: 4">
+        <header class="nx-card-h"><span class="nx-ico"><Icon name="clock" :size="17" /></span><div><h2>Prochaines échéances</h2><p>{{ agenda.retards ? `${agenda.retards} ticket(s) déjà en retard · ` : '' }}tickets non terminés</p></div></header>
+        <div v-if="agenda.prochains.length" class="nx-next">
+          <button v-for="r in agenda.prochains" :key="r.id" type="button" @click="router.push(`/tickets/${r.id}`)">
+            <span class="d"><b>{{ jourNum(r.echeance) }}</b><small>{{ mois(r.echeance) }}</small></span>
+            <span class="t">{{ r.titre }}<small>{{ tid(r.id) }} · {{ r.etat_echeance }}</small></span>
+            <Icon name="right" :size="15" class="text-slate-300" />
+          </button>
+        </div>
+        <p v-else class="text-sm text-slate-500">Aucune échéance à venir.</p>
+      </section>
+
+      <!-- Liste des tickets -->
+      <h2 class="nx-niveau nx-s12"><span>3</span>Tickets<small>Recherche, filtres et accès au détail</small></h2>
+      <section class="nx-card nx-s12 nx-in" style="--i: 5" aria-label="Liste des tickets">
+        <div class="nx-liste-bar">
+          <h2 class="mr-2 flex items-center gap-2 font-semibold" style="font-family: var(--font-display)">Liste des tickets <span class="nx-count">{{ d ? shown.length : 0 }}</span></h2>
+          <div class="relative ml-auto w-full sm:w-72">
+            <Icon name="search" :size="15" class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input v-model="q" class="input pl-9" placeholder="Rechercher un ticket" aria-label="Rechercher un ticket" />
+          </div>
+          <div class="nx-filtres">
+            <button v-for="f in FILTRES" :key="f.k" type="button" class="nx-chip" :class="filtre === f.k && 'is-on'" :aria-pressed="filtre === f.k" @click="filtre = f.k">{{ f.l }} <i>{{ count(f.k) }}</i></button>
+            <button v-if="filtreActif" type="button" class="nx-reset" @click="reinitialiser"><Icon name="x" :size="12" /> Réinitialiser</button>
+          </div>
+        </div>
+        <p v-if="membreF !== null" class="flex items-center gap-2 px-5 pt-3 text-xs text-slate-500">Filtré sur<button type="button" class="nx-chip is-on !py-0.5" @click="membreF = null">{{ filtreNom }} ✕</button></p>
+        <div class="overflow-x-auto">
+          <table class="nx-table min-w-[60rem]">
+            <thead>
+              <tr>
+                <th v-for="c in COLS" :key="c.k" :aria-sort="ariaSort(c.k)"><button @click="trier(c.k)">{{ c.l }} {{ fleche(c.k) }}</button></th>
+                <th class="c-act" aria-label="Actions" />
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in shown" :key="r.id" tabindex="0" role="link" @click="router.push(`/tickets/${r.id}`)" @keyup.enter="router.push(`/tickets/${r.id}`)">
+                <td>
+                  <div class="flex items-center">
+                    <span class="nx-row-bar" :style="{ background: accentLigne(r) }" />
+                    <div class="mr-3 flex w-14 shrink-0 -space-x-1">
+                      <Avatar v-for="m in equipe(r).slice(0, 2)" :key="m.id" :nom="m.nom" :src="photoCrm(m.photo)" :size="30" ring calm />
+                      <span v-if="!equipe(r).length" class="grid size-[30px] place-items-center rounded-full border border-dashed border-slate-300 text-slate-300"><Icon name="user" :size="13" /></span>
+                    </div>
+                    <div class="min-w-0">
+                      <p class="max-w-md truncate text-sm font-semibold" :title="r.titre">{{ r.titre }}</p>
+                      <p class="mt-0.5 text-xs font-medium text-slate-400">{{ tid(r.id) }}</p>
+                    </div>
+                  </div>
+                </td>
+                <td><StatutBadge :statut="r.statut" calm /><p v-if="r.cloture_a_valider" class="nx-cloture-flag"><Icon name="check" :size="11" /> Clôture à valider</p></td>
+                <td>
+                  <p class="text-sm" :class="r.situation === 'en_retard' ? 'font-semibold text-[color:var(--nx-late)]' : 'text-slate-700'">{{ r.etat_echeance }}</p>
+                  <p class="mt-0.5 text-xs text-slate-400">Échéance {{ fmtDate(r.echeance) }}</p>
+                </td>
+                <td><div class="nx-prog"><span><i :style="{ width: r.avancement_declare + '%' }" :class="r.situation === 'en_retard' && 'late'" /></span><b>{{ r.avancement_declare }} %</b></div></td>
+                <td class="text-right"><RouterLink :to="`/tickets/${r.id}`" class="nx-go" :aria-label="`Détails de ${r.titre}`" @click.stop>Détails <Icon name="right" :size="13" /></RouterLink></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <EmptyState v-if="d && !shown.length" icon="search" title="Aucun ticket" text="Aucun ticket ne correspond à ces filtres." />
+        <p v-if="!d && !err" class="p-6 text-center text-sm text-slate-500">Chargement…</p>
+      </section>
+    </div>
   </div>
-
-  <button v-if="sorted.length > PAGE" class="mt-3 text-sm font-medium text-teal underline-offset-2 hover:underline"
-          :aria-expanded="showAll" @click="showAll = !showAll">
-    {{ showAll ? 'Réduire' : `Voir les ${sorted.length - PAGE} autres tickets` }}
-  </button>
 </template>

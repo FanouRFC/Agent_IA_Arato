@@ -2,7 +2,7 @@
 import datetime as dt
 from typing import Optional
 
-from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, String, Table, Text, create_engine
+from sqlalchemy import JSON, Boolean, Column, Date, DateTime, ForeignKey, Integer, String, Table, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 from .config import settings
@@ -55,6 +55,8 @@ class Ticket(Base):
     motif_attente_courant: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     motif_retard_courant: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     projet_id: Mapped[int] = mapped_column(ForeignKey("projets.id"))
+    # Critères d'acceptation (liste de phrases vérifiables) fournis à la création par l'application : lecture seule ensuite
+    criteres_acceptation: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     membres = relationship(Membre, secondary=ticket_membres, lazy="selectin")
     depend_de = relationship(
         "Ticket", secondary=ticket_deps, lazy="selectin",
@@ -92,6 +94,7 @@ class Evenement(Base):
     __tablename__ = "evenements"
     id: Mapped[int] = mapped_column(primary_key=True)
     ticket_id: Mapped[int] = mapped_column(Integer, index=True)
+    projet_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)  # rattache l'événement à son projet
     type: Mapped[str] = mapped_column(String(40))
     detail: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(String(10), default="crm")  # crm (équipe) | service (backend)

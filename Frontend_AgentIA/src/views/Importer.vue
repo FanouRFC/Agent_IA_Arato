@@ -1,534 +1,493 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
-import { api, tid } from '@/services/api'
+import { useAnalyseStore } from '@/stores/analyse'
+import { useConfirmStore } from '@/stores/confirm'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { RouterLink, useRouter } from 'vue-router'
+import { api, fmtDateTime, photoCrm, post, put } from '@/services/api'
+import { useProjectStore } from '@/stores/project'
+import { useToastStore } from '@/stores/toast'
+import Avatar from '@/components/Avatar.vue'
+import ConfirmModal from '@/components/ConfirmModal.vue'
+import EmptyState from '@/components/EmptyState.vue'
+import Icon from '@/components/Icon.vue'
+import PageHeader from '@/components/PageHeader.vue'
+import { usePageBlanche } from '@/composables/usePageBlanche'
 
-const PRIORITES = ['haute', 'moyenne', 'basse']
-const ETAPES = ['Déposer le document', 'Relire les tâches', 'Créer les tickets']
-const EXT = ['.pdf', '.docx', '.txt', '.md']
-const MAX_TACHES = 10
-const BAR: Record<string, string> = { haute: 'border-l-brick', moyenne: 'border-l-ochre', basse: 'border-l-line' }
+usePageBlanche()
+const confirmer = useConfirmStore()
+const toast = useToastStore()
+const router = useRouter()
+const project = useProjectStore()
+const membres = ref<any[]>([]), cahiers = ref<any[]>([])
+const nomAuto = ref(false), nom = ref(''), texte = ref(''), fichier = ref<File | null>(null), mode = ref<'fichier' | 'texte'>('fichier'), drag = ref(false)
+const analyse = useAnalyseStore()
+const busy = computed(() => analyse.busy)           // l'analyse continue même si l'on quitte la page
+const cahier = ref<any>(null), validating = ref(false), confirm = ref(false), bilan = ref<any>(null), err = ref('')
+const PRIORITES = [
+  { v: 'haute', l: 'Haute', c: 'bg-red-500', t: 'text-red-700 bg-red-50' },
+  { v: 'moyenne', l: 'Moyenne', c: 'bg-purple-500', t: 'text-purple-700 bg-purple-50' },
+  { v: 'basse', l: 'Basse', c: 'bg-sky-400', t: 'text-sky-700 bg-sky-50' },
+]
+const prio = (v: string) => PRIORITES.find((p) => p.v === v) ?? PRIORITES[1]!
+const open = ref<Set<number>>(new Set())
+const affecter = ref<number | null>(null)
+const fermerAffecter = () => { affecter.value = null }
+onMounted(() => document.addEventListener('click', fermerAffecter))
+onUnmounted(() => document.removeEventListener('click', fermerAffecter))
 
-// ---------- État ----------
-const projets = ref<any[]>([])
-const membres = ref<any[]>([])
-const nom = ref('')
-const projetId = ref<number | null>(null)
-const texte = ref('')
-const fichier = ref<File | null>(null)
-const mode = ref<'fichier' | 'texte'>('fichier')
-const dragging = ref(false)
+const step = computed(() => (bilan.value ? 3 : cahier.value ? 2 : 1))
+const totalJours = computed(() => (cahier.value?.taches ?? []).reduce((s: number, t: any) => s + (t.duree_estimee || 0), 0))
+const sansMembre = computed(() => (cahier.value?.taches ?? []).filter((t: any) => !(t.membre_ids ?? []).length))
+const nbDeps = computed(() => (cahier.value?.taches ?? []).reduce((s: number, t: any) => s + (t.depend_de?.length || 0), 0))
+const nbMembres = computed(() => new Set((cahier.value?.taches ?? []).flatMap((t: any) => t.membre_ids || [])).size)
+/** Nom de projet unique : contrôle immédiat (liste des projets connus) puis contrôle du serveur (CRM compris, source de vérité). */
+const cle = (x: string) => x.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase()
+const nomServeur = ref('')
+const nomPris = computed(() => {
+  const k = cle(nom.value)
+  if (k.length < 2) return ''
+  const local = project.projets.find((p) => cle(p.nom) === k)?.nom
+  return local ? `Un projet nommé « ${local} » existe déjà. Choisissez un autre nom de projet.` : nomServeur.value
+})
+let minuterie: number | undefined
+watch(nom, (v) => {
+  nomServeur.value = ''
+  clearTimeout(minuterie)
+  if (cle(v).length < 2) return
+  minuterie = window.setTimeout(async () => {
+    try {
+      const r = await api(`/projets/nom-disponible?nom=${encodeURIComponent(v)}`)
+      if (v === nom.value) nomServeur.value = r.disponible ? '' : r.message
+    } catch { /* le serveur refusera de toute façon un doublon à l'analyse */ }
+  }, 300)
+})
+onUnmounted(() => clearTimeout(minuterie))
+const canAnalyse = computed(() => nom.value.trim().length >= 2 && !nomPris.value && (mode.value === 'fichier' ? !!fichier.value : texte.value.trim().length >= 30))
+const IDEES = ['lit le document en quelques secondes.', 'le découpe en tâches claires.', 'affecte les bonnes personnes.', 'calcule les échéances et les dépendances.', 'attend votre validation avant de créer quoi que ce soit.']
+const ETAPES = [
+  { i: 'upload', t: 'Vous déposez', d: 'PDF, Word ou simple texte collé.', puce: 'bg-[#F3F5F9] text-slate-600', bord: 'border-line', num: 'text-azur' },
+  { i: 'sparkles', t: "L'agent propose", d: 'Tâches, durées, dépendances et membres.', puce: 'bg-[#F3F5F9] text-slate-600', bord: 'border-line', num: 'text-azur' },
+  { i: 'check', t: 'Vous validez', d: 'Les tickets partent au CRM, les membres sont prévenus.', puce: 'bg-[#F3F5F9] text-slate-600', bord: 'border-line', num: 'text-azur' },
+]
+const idee = ref(0)
+let rotation: number | undefined
+onMounted(() => { rotation = window.setInterval(() => (idee.value = (idee.value + 1) % IDEES.length), 2600) })
+onUnmounted(() => clearInterval(rotation))
+const secondes = ref(0)
+let chrono: number | undefined
+const tic = () => { secondes.value = analyse.busy ? Math.floor((Date.now() - analyse.depart) / 1000) : 0 }
+onMounted(() => { tic(); chrono = window.setInterval(tic, 1000) })
+onUnmounted(() => clearInterval(chrono))
 
-const cahier = ref<any>(null)
-const bilan = ref<any>(null)
-const busy = ref(false)
-const err = ref('')
-const saved = ref('')
-const elapsed = ref(0)
-const confirming = ref(false)
-const confirmSuppr = ref<number | null>(null)
+// Étapes affichées pendant l'analyse (la dernière reste active jusqu'à la réponse de l'agent)
+const PHASES_BASE = ['Lecture du document', 'Décomposition en tâches', 'Affectation aux membres', 'Vérification de la cohérence']
+const estScan = computed(() => /\.(png|jpe?g|webp|bmp|tiff?|gif|pdf)$/i.test(analyse.fichierNom || ''))
+const PHASES = computed(() => estScan.value
+  ? ['Reconnaissance du texte (OCR)', ...PHASES_BASE]
+  : PHASES_BASE)
+const phase = computed(() => Math.min(PHASES.value.length - 1, Math.floor(secondes.value / (estScan.value ? 15 : 7))))
 
-const ouverts = ref<Set<number>>(new Set())
-const filtre = ref<'toutes' | 'verifier' | 'non_affectees'>('toutes')
-const showAll = ref(false)
-
-let tick: number | undefined
-let savedTimer: number | undefined
-let supprTimer: number | undefined
-
-onMounted(async () => {
+async function init() {
   try {
-    const [p, m] = await Promise.all([api('/crm/projets'), api('/crm/membres')])
-    projets.value = p
-    membres.value = m
-  } catch (e: any) {
-    err.value = e.message
-  }
-})
-onUnmounted(() => {
-  clearInterval(tick)
-  clearTimeout(savedTimer)
-  clearTimeout(supprTimer)
-})
-
-// ---------- Dérivés ----------
-const etape = computed(() => (bilan.value ? 3 : cahier.value ? 2 : 1))
-const taches = computed<any[]>(() => cahier.value?.taches ?? [])
-const membreMap = computed(() => new Map<number, any>(membres.value.map((m: any) => [m.id, m] as [number, any])))
-const byOrdre = computed(() => new Map<number, any>(taches.value.map((t: any) => [t.ordre, t] as [number, any])))
-
-const locked = (t: any) => !!t.id_ticket_crm
-const aVerifier = (t: any) =>
-  t.origine !== 'manuel' && ((t.niveau_confiance ?? 1) < 0.6 || (t.ambiguites ?? []).length > 0)
-const nonAffectee = (t: any) => !(t.membre_ids ?? []).length
-
-const aCreer = computed(() => taches.value.filter(t => !locked(t)))
-const nbVerifier = computed(() => aCreer.value.filter(aVerifier).length)
-const nbNonAffectees = computed(() => aCreer.value.filter(nonAffectee).length)
-const charge = computed(() => aCreer.value.reduce((n, t) => n + (Number(t.duree_estimee) || 0), 0))
-const nbMembres = computed(() => new Set(aCreer.value.flatMap(t => t.membre_ids ?? [])).size)
-
-const filtrees = computed(() => {
-  if (filtre.value === 'verifier') return taches.value.filter(aVerifier)
-  if (filtre.value === 'non_affectees') return taches.value.filter(t => nonAffectee(t) && !locked(t))
-  return taches.value
-})
-const visibles = computed(() => (showAll.value ? filtrees.value : filtrees.value.slice(0, MAX_TACHES)))
-
-const canAnalyse = computed(
-  () => !!nom.value.trim() && projetId.value !== null &&
-    (mode.value === 'fichier' ? !!fichier.value : texte.value.trim().length >= 30),
-)
-const mmss = computed(() => `${Math.floor(elapsed.value / 60)}:${String(elapsed.value % 60).padStart(2, '0')}`)
-
-// ---------- Outils d'affichage ----------
-function flash(m: string) {
-  saved.value = m
-  clearTimeout(savedTimer)
-  savedTimer = window.setTimeout(() => (saved.value = ''), 2500)
+    ;[membres.value, cahiers.value] = await Promise.all([api('/crm/membres'), api('/cahiers')])
+  } catch (e: any) { err.value = e.message }
 }
-const taille = (f: File) => (f.size > 1048576 ? `${(f.size / 1048576).toFixed(1)} Mo` : `${Math.max(1, Math.round(f.size / 1024))} Ko`)
-const has = (t: any, id: number) => (t.membre_ids ?? []).includes(id)
-const estReco = (t: any, m: any) =>
-  !!t.profil_recommande && String(m.profil ?? '').toLowerCase() === String(t.profil_recommande).toLowerCase()
-const membresTries = (t: any) => [...membres.value].sort((a, b) => Number(estReco(t, b)) - Number(estReco(t, a)))
-const nomsMembres = (t: any) =>
-  (t.membre_ids ?? []).map((i: number) => membreMap.value.get(i)?.nom).filter(Boolean).join(', ')
-const depLabel = (o: number) => byOrdre.value.get(o)?.titre ?? 'tâche supprimée'
-const pct = (t: any) => Math.round((t.niveau_confiance ?? 0) * 100)
-const confClass = (t: any) => (pct(t) >= 70 ? 'bg-teal' : pct(t) >= 40 ? 'bg-ochre' : 'bg-brick')
+let syncMembres: number | undefined
+onMounted(() => {
+  init()
+  // un membre ajouté ou modifié dans le CRM apparaît ici sans rechargement
+  syncMembres = window.setInterval(async () => { if (document.hidden) return; try { membres.value = await api('/crm/membres') } catch { /* silencieux */ } }, 4000)
+})
+onUnmounted(() => window.clearInterval(syncMembres))
 
-function toggleOuvert(id: number) {
-  const s = new Set(ouverts.value)
-  s.has(id) ? s.delete(id) : s.add(id)
-  ouverts.value = s
-}
-function toutDeplier(ouvrir: boolean) {
-  ouverts.value = ouvrir ? new Set(visibles.value.map(t => t.id)) : new Set()
-}
+const EXT_OK = /\.(pdf|docx?|pptx?|xlsx?|odt|odp|ods|rtf|txt|md|csv|tsv|json|xml|log|html?|png|jpe?g|webp|bmp|tiff?|gif)$/i
+const MAX_MO = 10
 
-// ---------- Dépôt ----------
-function pickFile(f: File | null) {
+function pick(f?: File | null) {
   if (!f) return
-  const ext = f.name.includes('.') ? f.name.slice(f.name.lastIndexOf('.')).toLowerCase() : ''
-  if (!EXT.includes(ext)) {
-    err.value = 'Formats acceptés : PDF, Word (.docx), texte (.txt, .md).'
-    return
-  }
-  err.value = ''
+  if (!EXT_OK.test(f.name)) { toast.err('Format non pris en charge.'); return }
+  if (f.size > MAX_MO * 1024 * 1024) { toast.err(`Fichier trop volumineux (${MAX_MO} Mo max).`); return }
   fichier.value = f
+  if (!nom.value || nomAuto.value) { nom.value = f.name.replace(/\.[^.]+$/, ''); nomAuto.value = true }
 }
-const onPick = (e: Event) => pickFile((e.target as HTMLInputElement).files?.[0] ?? null)
-function onDrop(e: DragEvent) {
-  dragging.value = false
-  pickFile(e.dataTransfer?.files?.[0] ?? null)
+
+function retirerFichier() {
+  fichier.value = null
+  if (nomAuto.value) { nom.value = ''; nomAuto.value = false }
 }
+function onDrop(e: DragEvent) { drag.value = false; pick(e.dataTransfer?.files?.[0]) }
 
 async function analyser() {
   err.value = ''
-  busy.value = true
-  elapsed.value = 0
-  tick = window.setInterval(() => elapsed.value++, 1000)
   const f = new FormData()
-  f.append('projet_nom', nom.value.trim())
-  f.append('crm_projet_id', String(projetId.value))
+  f.append('nom_projet', nom.value.trim())
   if (mode.value === 'fichier' && fichier.value) f.append('fichier', fichier.value)
   else f.append('texte', texte.value)
-  try {
-    cahier.value = await api('/cahiers', { method: 'POST', body: f })
-    ouverts.value = new Set()
-    filtre.value = 'toutes'
-    showAll.value = false
-  } catch (e: any) {
-    err.value = e.message
-  } finally {
-    busy.value = false
-    clearInterval(tick)
-  }
+  await analyse.lancer(f, nom.value.trim(), mode.value === 'fichier' ? (fichier.value?.name ?? '') : 'texte saisi')
+}
+/** Résultat de l'analyse (même si la page a été quittée puis rouverte) : brouillon à relire, ou erreur ; l'historique est rechargé. */
+function adopter() {
+  if (analyse.erreur) { err.value = analyse.erreur; analyse.effacerErreur() }
+  const c = analyse.reprendre()
+  if (c) { cahier.value = c; open.value = new Set([c.taches[0]?.id]) }
+  init()
+}
+watch(() => analyse.busy, (b) => { if (!b) adopter() })
+onMounted(() => { if (!analyse.busy) adopter() })
+
+async function reprendre(id: number) {
+  try { cahier.value = await api(`/cahiers/${id}`); bilan.value = null; open.value = new Set() } catch (e: any) { toast.err(e.message) }
+}
+const aSupprimer = ref<any>(null)
+async function supprimerEntree() {
+  const c = aSupprimer.value
+  aSupprimer.value = null
+  if (!c) return
+  try { await api(`/cahiers/${c.id}`, { method: 'DELETE' }); toast.ok('Entrée supprimée de l\'historique.'); await init() } catch (e: any) { toast.err(e.message) }
+}
+async function abandonner() {
+  if (!cahier.value) return
+  if (!(await confirmer.ask({ title: 'Abandonner ce brouillon ?', message: 'Le cahier en cours et ses tâches seront supprimés.', confirmLabel: 'Abandonner' }))) return
+  try { await api(`/cahiers/${cahier.value.id}`, { method: 'DELETE' }); cahier.value = null; await init(); toast.ok('Brouillon abandonné.') }
+  catch (e: any) { toast.err(e.message) }
 }
 
-// ---------- Relecture ----------
-async function save(t: any) {
-  t.duree_estimee = Math.max(1, Math.floor(Number(t.duree_estimee)) || 1)
-  try {
-    await api(`/taches/${t.id}`, {
-      method: 'PUT',
-      body: JSON.stringify({
-        titre: t.titre, description: t.description, priorite: t.priorite,
-        duree_estimee: t.duree_estimee, membre_ids: t.membre_ids,
-      }),
-    })
-    flash('Modification enregistrée')
-  } catch (e: any) {
-    err.value = e.message
-  }
-}
-
-function toggleMembre(t: any, id: number) {
-  const cur: number[] = t.membre_ids ?? []
-  t.membre_ids = cur.includes(id) ? cur.filter(x => x !== id) : [...cur, id]
-  save(t)
-}
+const save = (t: any) => put(`/taches/${t.id}`, {
+  titre: t.titre, description: t.description, priorite: t.priorite, duree_estimee: Math.max(1, Number(t.duree_estimee) || 1),
+  membre_ids: t.membre_ids, depend_de: t.depend_de, criteres_acceptation: (t.criteres_acceptation ?? []).filter((c: string) => c.trim().length >= 5),
+}).catch((e: any) => toast.err(e.message))
 
 async function remove(t: any) {
-  if (confirmSuppr.value !== t.id) {
-    confirmSuppr.value = t.id
-    clearTimeout(supprTimer)
-    supprTimer = window.setTimeout(() => (confirmSuppr.value = null), 4000)
-    return
-  }
-  confirmSuppr.value = null
+  if (!(await confirmer.ask({ title: 'Supprimer cette tâche ?', message: `« ${t.titre || 'Sans titre'} » sera retirée du cahier.`, confirmLabel: 'Supprimer' }))) return
   try {
     await api(`/taches/${t.id}`, { method: 'DELETE' })
     cahier.value.taches = cahier.value.taches.filter((x: any) => x.id !== t.id)
-    // Les autres tâches ne doivent plus dépendre de la tâche supprimée (sinon la validation échoue)
-    for (const x of cahier.value.taches) {
-      if ((x.depend_de ?? []).includes(t.ordre)) {
-        x.depend_de = x.depend_de.filter((d: number) => d !== t.ordre)
-        await api(`/taches/${x.id}`, { method: 'PUT', body: JSON.stringify({ depend_de: x.depend_de }) })
-      }
-    }
-    flash('Tâche supprimée')
-  } catch (e: any) {
-    err.value = e.message
-  }
+    for (const o of cahier.value.taches) o.depend_de = (o.depend_de || []).filter((d: number) => d !== t.ordre)
+  } catch (e: any) { toast.err(e.message) }
 }
-
 async function ajouter() {
   try {
-    const t = await api(`/cahiers/${cahier.value.id}/taches`, {
-      method: 'POST', body: JSON.stringify({ titre: 'Nouvelle tâche', duree_estimee: 1 }),
-    })
-    cahier.value.taches.push(t)
-    filtre.value = 'toutes'
-    showAll.value = true
-    ouverts.value = new Set([...ouverts.value, t.id])
-    await nextTick()
-    const el = document.getElementById(`titre-${t.id}`) as HTMLInputElement | null
-    el?.focus()
-    el?.select()
-  } catch (e: any) {
-    err.value = e.message
-  }
+    const t = await post(`/cahiers/${cahier.value.id}/taches`, { titre: 'Nouvelle tâche', duree_estimee: 1 })
+    cahier.value.taches.push(t); open.value.add(t.id)
+  } catch (e: any) { toast.err(e.message) }
 }
-
-// ---------- Validation ----------
+/** Validation : les tickets partent au CRM, puis un écran de transition confirme l'envoi (aucune redirection automatique). */
 async function valider() {
-  confirming.value = false
-  err.value = ''
-  busy.value = true
+  validating.value = true
   try {
-    bilan.value = await api(`/cahiers/${cahier.value.id}/valider`, { method: 'POST' })
-  } catch (e: any) {
-    err.value = e.message
-  } finally {
-    busy.value = false
-  }
+    bilan.value = await post(`/cahiers/${cahier.value.id}/valider`)
+    confirm.value = false
+    await project.load()
+    if (bilan.value.projet_id) project.recentId = bilan.value.projet_id    // mis en avant sur la page de choix du projet (jamais ouvert d'office)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  } catch (e: any) { toast.err(e.message); confirm.value = false }
+  validating.value = false
 }
-async function retourBrouillon() {
-  try {
-    cahier.value = await api(`/cahiers/${cahier.value.id}`)
-    bilan.value = null
-  } catch (e: any) {
-    err.value = e.message
-  }
+function nouveau() { cahier.value = null; bilan.value = null; nom.value = ''; nomAuto.value = false; texte.value = ''; fichier.value = null; init() }
+
+const ajouterCritere = (t: any) => { (t.criteres_acceptation ??= []).push('') }
+const retirerCritere = (t: any, i: number) => { t.criteres_acceptation.splice(i, 1); save(t) }
+const toggle = (id: number) => { const n = new Set(open.value); n.has(id) ? n.delete(id) : n.add(id); open.value = n }
+const titreDe = (ordre: number) => cahier.value?.taches.find((t: any) => t.ordre === ordre)?.titre ?? `Tâche ${ordre}`
+const membresDe = (t: any) => membres.value.filter((m) => (t.membre_ids || []).includes(m.id))
+function toggleMembre(t: any, id: number) {
+  const s = new Set<number>(t.membre_ids || []); s.has(id) ? s.delete(id) : s.add(id)
+  t.membre_ids = [...s]; save(t)
 }
-function recommencer() {
-  cahier.value = null
-  bilan.value = null
-  nom.value = ''
-  projetId.value = null
-  texte.value = ''
-  fichier.value = null
-  err.value = ''
+function toggleDep(t: any, ordre: number) {
+  const s = new Set<number>(t.depend_de || []); s.has(ordre) ? s.delete(ordre) : s.add(ordre)
+  t.depend_de = [...s]; save(t)
 }
+const STATUT_CAHIER: Record<string, { l: string; c: string }> = {
+  brouillon: { l: 'Brouillon', c: 'badge-amber' }, valide: { l: 'Validé', c: 'badge-green' }, partiel: { l: 'Partiel', c: 'badge-red' },
+}
+const STEPS = ['Déposer', 'Relire', 'Valider']
+const confiance = (c: number) => (c >= 0.7 ? 'bg-sky-400' : c >= 0.4 ? 'bg-purple-500' : 'bg-red-500')
 </script>
 
 <template>
-  <div class="flex flex-wrap items-center gap-x-6 gap-y-3">
-    <h1 class="text-2xl font-semibold">Cahier des charges</h1>
-    <ol class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm" aria-label="Étapes">
-      <li v-for="(label, i) in ETAPES" :key="label" class="flex items-center gap-2"
-          :aria-current="etape === i + 1 ? 'step' : undefined">
-        <span class="grid h-6 w-6 place-items-center rounded-full text-xs font-semibold"
-              :class="etape > i + 1 ? 'bg-teal text-white' : etape === i + 1 ? 'bg-ink text-white' : 'bg-line/60 text-ink/60'">
-          {{ etape > i + 1 ? '✓' : i + 1 }}
-        </span>
-        <span :class="etape === i + 1 ? 'font-semibold' : 'text-ink/60'">{{ label }}</span>
-        <span v-if="i < ETAPES.length - 1" class="mx-1 h-px w-6 bg-line" aria-hidden="true"></span>
+  <PageHeader title="Cahier des charges" subtitle="L'IA propose, vous validez : aucun ticket n'est créé avant votre validation.">
+    <RouterLink v-if="!bilan" to="/projets" class="btn-secondary">Passer au suivi d'un projet <Icon name="right" :size="15" /></RouterLink>
+  </PageHeader>
+
+  <!-- Étapes : la ligne se remplit à mesure que l'on avance -->
+  <ol class="mb-8 flex items-center" aria-label="Étapes">
+    <template v-for="(s, i) in STEPS" :key="s">
+      <li class="flex items-center gap-2.5" :aria-current="step === i + 1 ? 'step' : undefined">
+        <span class="grid size-8 place-items-center rounded-full text-xs font-semibold transition-all duration-500"
+          :class="step > i + 1 ? 'bg-gradient-to-br from-azur to-primary text-white' : step === i + 1 ? 'bg-gradient-to-br from-primary to-violet-arato text-white shadow-[0_0_0_5px_rgb(29_78_133/0.15)]' : 'bg-slate-200 text-slate-500'">
+          <Icon v-if="step > i + 1" name="check" :size="14" /><template v-else>{{ i + 1 }}</template></span>
+        <span class="text-sm" :class="step === i + 1 ? 'font-semibold text-slate-900' : 'text-slate-500'">{{ s }}</span>
       </li>
-    </ol>
-  </div>
+      <li v-if="i < STEPS.length - 1" class="mx-3 h-0.5 w-10 overflow-hidden rounded-full bg-slate-200 sm:w-20" aria-hidden="true">
+        <span class="block h-full rounded-full bg-gradient-to-r from-primary to-violet-arato transition-all duration-700" :style="{ width: step > i + 1 ? '100%' : '0%' }" />
+      </li>
+    </template>
+  </ol>
 
-  <div v-if="err" class="panel mt-4 flex items-start gap-3 border-l-4 border-l-brick" role="alert">
-    <p class="flex-1 text-sm text-brick">{{ err }}</p>
-    <button class="text-sm text-ink/60 hover:underline" @click="err = ''">Fermer</button>
-  </div>
+  <p v-if="err" class="mb-4 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert"><Icon name="alert" :size="16" class="mt-0.5" />{{ err }}</p>
 
-  <!-- ÉTAPE 3 : bilan -->
-  <section v-if="bilan" class="panel mt-5 max-w-3xl">
-    <h2 class="text-lg font-semibold">
-      {{ bilan.erreurs.length ? 'Création terminée avec des erreurs' : 'Tickets créés' }}
-    </h2>
-    <p class="mt-2">
-      <strong>{{ bilan.tickets_crees }}</strong> ticket(s) créé(s) dans le CRM. Les membres affectés ont été notifiés par e-mail.
-    </p>
-    <div v-if="bilan.erreurs.length" class="mt-3 rounded-lg border-l-4 border-l-brick bg-brick-soft/40 px-4 py-3">
-      <p class="text-sm font-medium text-brick">{{ bilan.erreurs.length }} tâche(s) n'ont pas pu être créées</p>
-      <ul class="mt-1 list-disc pl-5 text-sm"><li v-for="e in bilan.erreurs" :key="e">{{ e }}</li></ul>
-    </div>
-    <div class="mt-4 flex flex-wrap gap-2">
-      <button v-if="bilan.erreurs.length" class="btn" @click="retourBrouillon">Revenir au brouillon</button>
-      <button class="btn-quiet" @click="recommencer">Déposer un autre cahier</button>
-    </div>
-  </section>
-
-  <!-- ÉTAPE 1 : dépôt -->
-  <section v-else-if="!cahier" class="panel mt-5 max-w-3xl">
-    <p class="text-sm text-ink/70">
-      Déposez le cahier des charges du chef de projet. L'agent propose des tâches, mais aucun ticket n'est créé avant votre validation.
-    </p>
-
-    <fieldset :disabled="busy" class="mt-4 min-w-0 space-y-5">
-      <div class="grid gap-4 sm:grid-cols-2">
-        <label class="block text-sm font-medium">Nom du projet
-          <input v-model="nom" class="field mt-1 font-normal" placeholder="Ex. Refonte du portail client" />
-        </label>
-        <label class="block text-sm font-medium">Projet du CRM
-          <select v-model="projetId" class="field mt-1 font-normal">
-            <option :value="null" disabled>Choisir un projet…</option>
-            <option v-for="p in projets" :key="p.id" :value="p.id">{{ p.nom }}</option>
-          </select>
-        </label>
-      </div>
-
-      <div>
-        <div class="inline-flex rounded-lg border border-line p-0.5 text-sm" role="group" aria-label="Source du document">
-          <button type="button" class="rounded-md px-3 py-1.5 transition"
-                  :class="mode === 'fichier' ? 'bg-ink text-white' : 'text-ink/70 hover:text-ink'"
-                  :aria-pressed="mode === 'fichier'" @click="mode = 'fichier'">Importer un fichier</button>
-          <button type="button" class="rounded-md px-3 py-1.5 transition"
-                  :class="mode === 'texte' ? 'bg-ink text-white' : 'text-ink/70 hover:text-ink'"
-                  :aria-pressed="mode === 'texte'" @click="mode = 'texte'">Coller du texte</button>
-        </div>
-
-        <label v-if="mode === 'fichier'"
-               class="mt-3 flex cursor-pointer flex-col items-center justify-center gap-1 rounded-xl border-2 border-dashed px-4 py-8 text-center transition focus-within:outline-2 focus-within:outline-teal"
-               :class="dragging ? 'border-teal bg-teal-soft/40' : 'border-line hover:border-ink/40'"
-               @dragover.prevent="dragging = true" @dragleave="dragging = false" @drop.prevent="onDrop">
-          <input type="file" accept=".pdf,.docx,.txt,.md" class="sr-only" @change="onPick" />
-          <template v-if="fichier">
-            <span class="font-medium">{{ fichier.name }}</span>
-            <span class="text-xs text-ink/60">{{ taille(fichier) }} · cliquez pour changer de fichier</span>
-          </template>
-          <template v-else>
-            <span class="font-medium">Glissez le fichier ici ou cliquez pour le choisir</span>
-            <span class="text-xs text-ink/60">PDF, Word (.docx) ou texte (.txt, .md)</span>
-          </template>
-        </label>
-
-        <div v-else class="mt-3">
-          <textarea v-model="texte" rows="8" class="field" aria-label="Texte du cahier des charges"
-                    placeholder="Collez ici le contenu du cahier des charges…"></textarea>
-          <p class="mt-1 text-xs" :class="texte.trim().length >= 30 ? 'text-ink/60' : 'text-ochre'">
-            {{ texte.trim().length }} caractères · 30 minimum
-          </p>
-        </div>
-      </div>
-    </fieldset>
-
-    <div class="mt-5 flex flex-wrap items-center gap-3">
-      <button class="btn" :disabled="busy || !canAnalyse" @click="analyser">
-        {{ busy ? 'Analyse en cours…' : 'Analyser le document' }}
-      </button>
-      <p v-if="!busy && !canAnalyse" class="text-xs text-ink/60">Renseignez le nom, le projet et le document.</p>
-    </div>
-
-    <div v-if="busy" class="mt-5 flex items-start gap-3 rounded-lg bg-line/30 px-4 py-3" role="status">
-      <svg class="mt-0.5 h-5 w-5 shrink-0 animate-spin text-teal" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" opacity=".25" />
-        <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
-      </svg>
-      <div class="text-sm">
-        <p class="font-medium">L'agent analyse le document · {{ mmss }}</p>
-        <p class="mt-0.5 text-ink/70">
-          Il lit le cahier, le décompose en tâches, vérifie les dépendances et la cohérence, puis produit un brouillon.
-          Avec un modèle local, cela peut prendre une à deux minutes. Gardez cette page ouverte.
-        </p>
-      </div>
-    </div>
-  </section>
-
-  <!-- ÉTAPE 2 : relecture -->
-  <template v-else>
-    <section class="panel mt-5">
-      <div class="flex flex-wrap items-end gap-x-8 gap-y-3">
-        <div>
-          <p class="text-3xl font-semibold leading-none tabular-nums">{{ aCreer.length }}</p>
-          <p class="mt-1 text-sm text-ink/70">tâche(s) à créer</p>
-        </div>
-        <div>
-          <p class="text-3xl font-semibold leading-none tabular-nums" :class="nbVerifier ? 'text-ochre' : ''">{{ nbVerifier }}</p>
-          <p class="mt-1 text-sm text-ink/70">à vérifier</p>
-        </div>
-        <div>
-          <p class="text-3xl font-semibold leading-none tabular-nums" :class="nbNonAffectees ? 'text-ochre' : ''">{{ nbNonAffectees }}</p>
-          <p class="mt-1 text-sm text-ink/70">sans responsable</p>
-        </div>
-        <div>
-          <p class="text-3xl font-semibold leading-none tabular-nums">{{ charge }}</p>
-          <p class="mt-1 text-sm text-ink/70">jours ouvrés cumulés</p>
-        </div>
-      </div>
-      <p class="mt-4 text-sm text-ink/70">
-        Ce brouillon est proposé par l'IA. Ouvrez une tâche pour la modifier, puis validez : les tickets ne sont créés qu'à ce moment-là.
+  <!-- Écran de transition après la validation -->
+  <section v-if="bilan" class="card rise relative overflow-hidden px-6 py-14 text-center sm:py-16">
+    <div class="pointer-events-none absolute left-1/2 top-0 size-80 -translate-x-1/2 -translate-y-1/2 rounded-full bg-gradient-to-br from-azur/30 to-violet-arato/25 blur-3xl" aria-hidden="true" />
+    <div class="relative">
+      <span class="pop mx-auto grid size-20 place-items-center rounded-full text-white shadow-lg"
+        :class="bilan.erreurs.length ? 'bg-gradient-to-br from-purple-500 to-red-500' : 'bg-gradient-to-br from-azur via-primary to-violet-arato'">
+        <svg v-if="!bilan.erreurs.length" viewBox="0 0 24 24" width="38" height="38" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M5 12.5l4.5 4.5L19 7.5" stroke-dasharray="26" stroke-dashoffset="26" style="animation: draw .6s .35s ease-out forwards" /></svg>
+        <Icon v-else name="alert" :size="34" />
+      </span>
+      <h2 class="display mt-6 text-3xl text-slate-900">{{ bilan.erreurs.length ? 'Envoi partiel au CRM' : 'Les tickets ont bien été envoyés au CRM' }}</h2>
+      <p class="mx-auto mt-3 max-w-lg text-sm leading-relaxed text-slate-600">
+        Projet « <b class="text-slate-900">{{ bilan.projet }}</b> » créé · {{ bilan.tickets_crees }} ticket(s) envoyé(s).
       </p>
+      <!-- Bilan des e-mails : toujours dit clairement, qu'ils soient partis, bloqués ou impossibles -->
+      <ul class="mx-auto mt-5 max-w-lg space-y-2 text-left text-sm">
+        <li v-if="bilan.mails_envoyes && bilan.envoi_reel" class="flex items-start gap-2.5 rounded-xl border border-line bg-white p-3"><Icon name="check" :size="16" class="mt-0.5 shrink-0 text-slate-900" />
+          <span><b class="text-slate-900">{{ bilan.mails_envoyes }} e-mail(s) d'affectation envoyé(s)</b> à {{ bilan.destinataires.join(', ') }}.</span></li>
+        <li v-else-if="bilan.mails_envoyes" class="flex items-start gap-2.5 rounded-xl border border-line bg-white p-3"><Icon name="alert" :size="16" class="mt-0.5 shrink-0 text-azur" />
+          <span><b class="text-slate-900">{{ bilan.mails_envoyes }} e-mail(s) remis au serveur de test local.</b> Une copie de chaque message est conservée dans le dossier « data/outbox » du serveur ; aucune vraie boîte de réception ne les reçoit tant qu'un compte d'envoi réel n'est pas renseigné côté serveur.</span></li>
+        <li v-if="bilan.mails_en_echec" class="flex items-start gap-2.5 rounded-xl border border-line bg-white p-3"><Icon name="alert" :size="16" class="mt-0.5 shrink-0 text-azur" />
+          <span><b class="text-slate-900">{{ bilan.mails_en_echec }} e-mail(s) non envoyé(s).</b> Les tickets sont bien créés. <span v-if="bilan.mails_causes?.length" class="text-slate-500">Cause : {{ bilan.mails_causes.join(' · ') }}</span></span></li>
+        <li v-if="bilan.taches_sans_membre" class="flex items-start gap-2.5 rounded-xl border border-line bg-white p-3"><Icon name="users" :size="16" class="mt-0.5 shrink-0 text-azur" />
+          <span><b class="text-slate-900">{{ bilan.taches_sans_membre }} tâche(s) sans membre affecté</b> : personne n'est prévenu pour celles-ci. Affectez un ou plusieurs membres avant de valider.</span></li>
+      </ul>
+      <div v-if="bilan.erreurs.length" class="mx-auto mt-5 max-w-lg rounded-xl border border-red-200 bg-red-50 p-4 text-left text-sm text-red-800">
+        <p class="font-medium">{{ bilan.erreurs.length }} ticket(s) n'ont pas pu être transmis au CRM :</p>
+        <ul class="mt-1.5 list-disc space-y-0.5 pl-5"><li v-for="e in bilan.erreurs" :key="e">{{ e }}</li></ul>
+        <p class="mt-2 text-xs text-red-700">Le cahier reste en statut « partiel » : validez-le de nouveau pour réessayer uniquement ces tickets.</p></div>
+      <div class="mt-8 flex flex-wrap justify-center gap-3">
+        <RouterLink to="/projets" class="btn-primary px-5 py-2.5 text-[15px]">Choisir un projet à suivre <Icon name="right" :size="16" /></RouterLink>
+        <button class="btn-secondary px-5 py-2.5 text-[15px]" @click="nouveau">Déposer un autre cahier</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Étape 1 : dépôt -->
+  <template v-else-if="!cahier">
+    <section class="card rise relative overflow-hidden">
+      <!-- Analyse en cours : étapes animées -->
+      <div v-if="busy" class="relative px-6 py-12 text-center sm:px-10" role="status" aria-live="polite">
+        <span class="relative mx-auto grid size-16 place-items-center rounded-2xl bg-gradient-to-br from-azur via-primary to-violet-arato text-white shadow-lg aura"><Icon name="sparkles" :size="28" class="floaty" /></span>
+        <h2 class="display mt-5 text-2xl text-slate-900">L'agent analyse votre document</h2>
+        <p class="muted mt-1">Avec un modèle en ligne, comptez une à deux minutes. <span class="tabular-nums">{{ secondes }} s</span></p>
+        <ol class="mx-auto mt-7 max-w-sm space-y-3 text-left">
+          <li v-for="(p, i) in PHASES" :key="p" class="flex items-center gap-3 text-sm transition-opacity duration-500" :class="i > phase ? 'opacity-40' : ''">
+            <span class="grid size-6 shrink-0 place-items-center rounded-full text-white transition-colors duration-500"
+              :class="i < phase ? 'bg-sky-400' : i === phase ? 'bg-brand-600' : 'bg-slate-300'">
+              <Icon v-if="i < phase" name="check" :size="13" /><Icon v-else-if="i === phase" name="refresh" :size="13" class="animate-spin" /></span>
+            <span :class="i === phase ? 'font-semibold text-slate-900' : 'text-slate-600'">{{ p }}<span v-if="i === phase">…</span></span>
+          </li>
+        </ol>
+        <div class="mx-auto mt-7 h-1.5 max-w-sm overflow-hidden rounded-full bg-slate-100"><div class="shimmer h-full w-full bg-brand-300/60" /></div>
+      </div>
+
+      <div v-else class="theme-clair relative grid gap-8 bg-white p-6 sm:p-10 lg:grid-cols-[1fr_1.1fr] lg:items-center">
+        <!-- Grand message d'accueil, qui change tout seul pour montrer ce que fera l'agent -->
+        <div class="relative">
+          <p class="inline-flex items-center gap-2 rounded-full border border-line bg-white px-3 py-1 text-xs font-semibold uppercase tracking-[.14em] text-slate-500"><span class="size-1.5 rounded-full bg-azur" />Étape 1 · Dépôt</p>
+          <h2 class="display mt-5 text-[2.4rem] leading-[1.08] text-slate-900 sm:text-5xl">Déposez votre <span class="bg-[linear-gradient(transparent_66%,#DEEFEE_66%)]">cahier des charges</span>.</h2>
+          <p class="mt-4 min-h-[3.4rem] text-xl text-slate-600" aria-live="polite">
+            <Transition name="fade" mode="out-in"><span :key="idee" class="inline-block"><b class="font-semibold text-azur">L'agent</b> {{ IDEES[idee] }}</span></Transition></p>
+          <ol class="mt-8 grid max-w-md gap-3">
+            <li v-for="(e, k) in ETAPES" :key="e.t" class="group flex items-center gap-3 rounded-2xl border bg-white/90 px-4 py-3 shadow-sm backdrop-blur transition hover:-translate-y-0.5 hover:shadow-card" :class="e.bord">
+              <span class="grid size-10 shrink-0 place-items-center rounded-xl transition group-hover:scale-105" :class="e.puce"><Icon :name="e.i" :size="18" /></span>
+              <span class="text-sm"><b class="text-slate-900"><span class="mr-1 tabular-nums" :class="e.num">0{{ k + 1 }}</span>{{ e.t }}</b><span class="block text-slate-500">{{ e.d }}</span></span></li>
+          </ol>
+        </div>
+
+        <!-- Zone de dépôt : carte structurée en deux blocs numérotés -->
+        <div class="relative overflow-hidden rounded-3xl border border-line bg-white shadow-card">
+          <div class="h-1 bg-azur" />
+          <div class="p-5 sm:p-6">
+            <p class="flex items-center gap-2 text-sm font-semibold text-slate-900"><span class="grid size-6 place-items-center rounded-full bg-azur text-xs text-white">1</span>Votre document</p>
+            <div class="mt-3 inline-flex rounded-xl bg-[#F2F4F8] p-1 text-sm" role="tablist">
+              <button v-for="m in (['fichier', 'texte'] as const)" :key="m" role="tab" :aria-selected="mode === m" class="rounded-lg px-3.5 py-1.5 font-medium transition"
+                :class="mode === m ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'" @click="mode = m">{{ m === 'fichier' ? 'Importer un fichier' : 'Coller le texte' }}</button>
+            </div>
+
+            <label v-if="mode === 'fichier'" class="depot depot-couleur mt-3" :class="[drag && 'depot-actif', fichier && 'depot-pret']"
+              @dragover.prevent="drag = true" @dragleave="drag = false" @drop.prevent="onDrop">
+              <span class="depot-icone"><Icon :name="fichier ? 'file' : 'upload'" :size="30" /></span>
+              <template v-if="!fichier">
+                <span class="mt-4 text-lg font-semibold text-slate-900">{{ drag ? 'Relâchez pour déposer' : 'Glissez votre document ici' }}</span>
+                <span class="mt-1 text-sm text-slate-500">ou <span class="font-medium text-azur underline decoration-2 underline-offset-4">parcourez vos fichiers</span></span>
+              </template>
+              <template v-else>
+                <span class="mt-4 text-lg font-semibold text-slate-900">{{ fichier.name }}</span>
+                <span class="mt-1 text-sm text-slate-500">{{ Math.round(fichier.size / 1024) }} Ko · prêt à être analysé</span>
+                <button type="button" class="mt-3 text-xs font-medium text-slate-500 underline underline-offset-4 hover:text-slate-900" @click.prevent="retirerFichier">Choisir un autre fichier</button>
+              </template>
+              <span class="mt-5 flex gap-1.5 text-[11px] font-semibold uppercase tracking-wider"><span v-for="(f, k) in ['PDF','Word', 'Excel', 'PPT','Image','…']" :key="f" class="rounded-md px-2 py-0.5" :class="'bg-[#F3F5F9] text-slate-500'">{{ f }}</span><span class="px-1 py-0.5 normal-case tracking-normal text-slate-400">10 Mo max</span></span>
+              <input type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.odt,.odp,.ods,.rtf,.txt,.md,.csv,.tsv,.json,.xml,.log,.html,.htm,image/*" class="sr-only" @change="(e: Event) => { const el = e.target as HTMLInputElement; pick(el.files?.[0]); el.value = '' }" />
+            </label>
+            <textarea v-else v-model="texte" rows="9" class="input mt-3 rounded-2xl" placeholder="Collez ici le contenu du cahier des charges…" aria-label="Texte du cahier des charges" />
+
+            <p class="mt-6 flex items-center gap-2 text-sm font-semibold text-slate-900"><span class="grid size-6 place-items-center rounded-full bg-azur text-xs text-white">2</span>Nom du projet</p>
+            <div class="mt-3"><label class="sr-only" for="np">Nom du projet</label>
+              <input id="np" v-model="nom" class="input" :class="nomPris && 'border-red-400!'" placeholder="Ex. Portail client v2"
+                :aria-invalid="!!nomPris" aria-describedby="np-err" />
+              <p v-if="nomPris" id="np-err" class="mt-1.5 flex items-center gap-1.5 text-sm text-red-700" role="alert"><Icon name="alert" :size="14" />{{ nomPris }}</p></div>
+            <button class="btn-primary mt-5 w-full justify-center py-3 text-[15px]" :disabled="!canAnalyse" @click="analyser"><Icon name="sparkles" :size="16" /> Lancer l'analyse par l'agent</button>
+            <p class="mt-2 flex items-center justify-center gap-1.5 text-center text-xs text-slate-500"><Icon name="check" :size="12" />Rien n'est créé avant votre validation.</p>
+          </div>
+        </div>
+      </div>
     </section>
 
-    <details v-if="(cahier.ambiguites ?? []).length" class="panel mt-3 border-l-4 border-l-ochre"
-             :open="cahier.ambiguites.length <= 3">
-      <summary class="cursor-pointer font-semibold">
-        Ambiguïtés et informations manquantes ({{ cahier.ambiguites.length }})
-      </summary>
-      <ul class="mt-2 list-disc space-y-1 pl-5 text-sm"><li v-for="a in cahier.ambiguites" :key="a">{{ a }}</li></ul>
-    </details>
+    <section class="mt-8">
+      <h2 class="card-title">Historique</h2>
+      <div class="card mt-3 overflow-x-auto">
+        <table v-if="cahiers.length || busy" class="table-clean">
+          <thead><tr><th>Projet</th><th>Fichier</th><th>Déposé le</th><th>Tâches</th><th>Statut</th><th /></tr></thead>
+          <tbody><tr v-if="busy" class="bg-amber-50/50" aria-live="polite">
+            <td class="font-medium text-slate-900">{{ analyse.nom }}</td><td class="text-slate-600">{{ analyse.fichierNom }}</td>
+            <td class="text-slate-600">{{ fmtDateTime(new Date(analyse.depart).toISOString()) }}</td><td class="tabular-nums">…</td>
+            <td><span class="badge-amber">Analyse en cours · {{ secondes }} s</span></td><td />
+          </tr>
+          <tr v-for="c in cahiers" :key="c.id">
+            <td class="font-medium text-slate-900">{{ c.nom_projet }}</td><td class="text-slate-600">{{ c.nom_fichier }}</td>
+            <td class="text-slate-600">{{ fmtDateTime(c.date_depot) }}</td><td class="tabular-nums">{{ c.nb_taches }}</td>
+            <td><span :class="STATUT_CAHIER[c.statut]?.c ?? 'badge-slate'">{{ STATUT_CAHIER[c.statut]?.l ?? c.statut }}</span></td>
+            <td class="text-right whitespace-nowrap"><button v-if="c.statut !== 'valide'" class="btn-secondary btn-sm mr-2" @click="reprendre(c.id)">Reprendre</button>
+              <button class="btn-danger btn-sm" :aria-label="`Supprimer l'entrée ${c.nom_projet}`" @click="aSupprimer = c"><Icon name="trash" :size="13" /> Supprimer</button></td>
+          </tr></tbody>
+        </table>
+        <EmptyState v-else icon="file" title="Aucun cahier déposé" text="Les cahiers que vous déposez apparaissent ici, avec leur statut." />
+      </div>
+    </section>
 
-    <div class="mt-5 flex flex-wrap items-center gap-2">
-      <button v-for="f in [
-        { k: 'toutes', l: `Toutes (${taches.length})` },
-        { k: 'verifier', l: `À vérifier (${taches.filter(aVerifier).length})` },
-        { k: 'non_affectees', l: `Sans responsable (${nbNonAffectees})` },
-      ]" :key="f.k" type="button" class="rounded-full border px-3 py-1 text-sm transition"
-              :class="filtre === f.k ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink/40'"
-              :aria-pressed="filtre === f.k" @click="filtre = f.k as typeof filtre; showAll = false">{{ f.l }}</button>
-      <span class="ml-auto flex gap-3 text-sm">
-        <button class="text-teal hover:underline" @click="toutDeplier(true)">Tout déplier</button>
-        <button class="text-teal hover:underline" @click="toutDeplier(false)">Tout replier</button>
-      </span>
+    <ConfirmModal :open="!!aSupprimer" title="Supprimer cette entrée ?" confirm-label="Supprimer" @confirm="supprimerEntree" @cancel="aSupprimer = null">
+      <p>L'entrée « <b>{{ aSupprimer?.nom_projet }}</b> » sera retirée de l'historique des cahiers des charges.</p>
+      <p class="mt-2 text-slate-500">Le projet et les tickets déjà créés dans le CRM ne sont pas supprimés.</p>
+    </ConfirmModal>
+  </template>
+
+  <!-- Étape 2 : relecture -->
+  <template v-else>
+    <div class="mb-5 flex flex-wrap items-center gap-3">
+      <h2 class="display text-xl text-slate-900">{{ cahier.nom_projet }}</h2>
+      <button class="btn-ghost btn-sm ml-auto" @click="cahier = null; init()"><Icon name="left" :size="14" /> Retour</button>
     </div>
 
-    <p v-if="!visibles.length" class="mt-4 text-ink/70">Aucune tâche dans ce filtre.</p>
-
-    <article v-for="t in visibles" :key="t.id" class="panel mt-3 border-l-4 !p-0" :class="BAR[t.priorite]">
-      <div class="flex flex-wrap items-center gap-2 px-3 py-3">
-        <button type="button" class="grid h-8 w-8 place-items-center rounded hover:bg-line/50"
-                :aria-expanded="ouverts.has(t.id)" :aria-label="ouverts.has(t.id) ? 'Replier la tâche' : 'Déplier la tâche'"
-                @click="toggleOuvert(t.id)">
-          <svg class="h-4 w-4 transition-transform" :class="ouverts.has(t.id) ? 'rotate-90' : ''" viewBox="0 0 24 24"
-               fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="m9 6 6 6-6 6" />
-          </svg>
-        </button>
-        <span class="text-xs font-semibold tabular-nums text-ink/50">#{{ t.ordre }}</span>
-        <input :id="`titre-${t.id}`" v-model="t.titre" :disabled="locked(t)" aria-label="Titre"
-               class="field min-w-48 flex-1 border-transparent! bg-transparent! font-medium! hover:border-line! focus:border-teal!"
-               @change="save(t)" />
-        <select v-model="t.priorite" :disabled="locked(t)" class="field w-28!" aria-label="Priorité" @change="save(t)">
-          <option v-for="p in PRIORITES" :key="p">{{ p }}</option>
-        </select>
-        <label class="flex items-center gap-1 text-sm text-ink/80">
-          <input v-model.number="t.duree_estimee" type="number" min="1" :disabled="locked(t)" class="field w-16!"
-                 aria-label="Durée en jours ouvrés" @change="save(t)" /> j
-        </label>
+    <!-- Synthèse de la proposition (quatre repères de même hauteur) -->
+    <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div v-for="(k, i) in [
+        { v: cahier.taches.length, l: 'tâches proposées', i: 'list' },
+        { v: totalJours, l: 'jours cumulés', i: 'calendar' },
+        { v: nbMembres, l: 'membres mobilisés', i: 'users' },
+        { v: nbDeps, l: 'dépendances', i: 'link' },
+      ]" :key="k.l" class="card rise flex items-center gap-3 px-4 py-3.5" :style="{ animationDelay: Number(i) * 70 + 'ms' }">
+        <span class="grid size-10 shrink-0 place-items-center rounded-xl bg-brand-100 text-brand-700"><Icon :name="k.i" :size="18" /></span>
+        <div class="leading-tight"><p class="display text-2xl tabular-nums text-slate-900">{{ k.v }}</p><p class="text-xs text-slate-500">{{ k.l }}</p></div>
       </div>
-
-      <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3 pb-3 pl-14 text-xs">
-        <span v-if="locked(t)" class="rounded bg-teal-soft px-1.5 py-0.5 font-medium text-teal">Ticket {{ tid(t.id_ticket_crm) }} créé</span>
-        <span v-if="t.origine === 'manuel'" class="rounded bg-line/60 px-1.5 py-0.5 text-ink/70">Ajoutée manuellement</span>
-        <span v-else-if="aVerifier(t)" class="rounded bg-ochre-soft px-1.5 py-0.5 font-medium text-ochre">À vérifier</span>
-        <span v-if="nonAffectee(t) && !locked(t)" class="rounded bg-ochre-soft px-1.5 py-0.5 font-medium text-ochre">Sans responsable</span>
-        <span v-else-if="nomsMembres(t)" class="text-ink/70">Affectée à {{ nomsMembres(t) }}</span>
-        <span v-if="(t.depend_de ?? []).length" class="text-ink/60">Après {{ t.depend_de.map((d: number) => '#' + d).join(', ') }}</span>
-      </div>
-
-      <div v-if="ouverts.has(t.id)" class="space-y-4 border-t border-line px-4 py-4">
-        <label class="block text-sm font-medium">Description
-          <textarea v-model="t.description" rows="3" :disabled="locked(t)" class="field mt-1 font-normal" @change="save(t)"></textarea>
-        </label>
-
-        <div v-if="(t.criteres_acceptation ?? []).length">
-          <p class="text-sm font-medium">Critères d'acceptation</p>
-          <ul class="mt-1 list-disc space-y-0.5 pl-5 text-sm text-ink/90"><li v-for="c in t.criteres_acceptation" :key="c">{{ c }}</li></ul>
-        </div>
-
-        <div v-if="(t.depend_de ?? []).length">
-          <p class="text-sm font-medium">Doit commencer après</p>
-          <ul class="mt-1 space-y-0.5 text-sm text-ink/90">
-            <li v-for="d in t.depend_de" :key="d"><span class="font-semibold tabular-nums">#{{ d }}</span> {{ depLabel(d) }}</li>
-          </ul>
-        </div>
-
-        <div v-if="t.origine !== 'manuel'" class="grid gap-3 text-sm sm:grid-cols-2">
-          <div>
-            <p class="font-medium">Priorité</p>
-            <p class="text-ink/80">{{ t.raison_priorite || 'Aucune raison fournie.' }}</p>
-          </div>
-          <div>
-            <p class="font-medium">Confiance de l'IA</p>
-            <p class="mt-1 flex items-center gap-2 text-ink/80">
-              <span class="h-1.5 w-24 overflow-hidden rounded-full bg-line" aria-hidden="true">
-                <span class="block h-full rounded-full" :class="confClass(t)" :style="{ width: pct(t) + '%' }"></span>
-              </span>
-              {{ pct(t) }} %
-              <span v-if="t.profil_recommande" class="text-ink/60">· profil recommandé : {{ t.profil_recommande }}</span>
-            </p>
-          </div>
-        </div>
-
-        <blockquote v-if="t.source_dans_document" class="border-l-2 border-line pl-3 text-sm italic text-ink/70">
-          <span class="not-italic font-medium text-ink/80">Extrait du document : </span>« {{ t.source_dans_document }} »
-        </blockquote>
-
-        <div v-if="(t.ambiguites ?? []).length" class="rounded-lg bg-ochre-soft/40 px-3 py-2">
-          <p class="text-sm font-medium text-ochre">À clarifier</p>
-          <ul class="mt-1 list-disc pl-5 text-sm"><li v-for="a in t.ambiguites" :key="a">{{ a }}</li></ul>
-        </div>
-
-        <div>
-          <p class="text-sm font-medium">Affectation <span class="font-normal text-ink/60">(un ou plusieurs membres)</span></p>
-          <div class="mt-2 flex flex-wrap gap-2">
-            <button v-for="m in membresTries(t)" :key="m.id" type="button" :disabled="locked(t)"
-                    class="rounded-full border px-3 py-1 text-sm transition focus-visible:outline-2 focus-visible:outline-teal"
-                    :class="has(t, m.id) ? 'border-teal bg-teal-soft font-medium text-teal' : 'border-line hover:border-ink/40'"
-                    :aria-pressed="has(t, m.id)" @click="toggleMembre(t, m.id)">
-              {{ m.nom }} <span class="text-xs opacity-70">· {{ m.profil }}</span>
-              <span v-if="estReco(t, m)" class="ml-1 text-xs">(profil recommandé)</span>
-            </button>
-          </div>
-        </div>
-
-        <div v-if="!locked(t)" class="flex justify-end">
-          <button type="button" class="text-sm hover:underline"
-                  :class="confirmSuppr === t.id ? 'font-semibold text-brick' : 'text-ink/60'" @click="remove(t)">
-            {{ confirmSuppr === t.id ? 'Confirmer la suppression' : 'Supprimer cette tâche' }}
-          </button>
-        </div>
-      </div>
-    </article>
-
-    <button v-if="filtrees.length > MAX_TACHES" class="mt-3 text-sm font-medium text-teal underline-offset-2 hover:underline"
-            :aria-expanded="showAll" @click="showAll = !showAll">
-      {{ showAll ? 'Réduire' : `Voir les ${filtrees.length - MAX_TACHES} autres tâches` }}
-    </button>
-
-    <!-- Barre d'action -->
-    <div class="panel sticky bottom-4 z-10 mt-6 flex flex-wrap items-center gap-3 shadow-lg">
-      <template v-if="!confirming">
-        <p class="min-w-0 flex-1 text-sm text-ink/70" aria-live="polite">
-          {{ saved || `${aCreer.length} ticket(s) prêt(s) à créer` }}
-        </p>
-        <button class="btn-quiet" :disabled="busy" @click="ajouter">Ajouter une tâche</button>
-        <button class="btn" :disabled="busy || !aCreer.length" @click="confirming = true">
-          {{ busy ? 'Création…' : 'Valider et créer les tickets' }}
-        </button>
-      </template>
-      <template v-else>
-        <p class="min-w-0 flex-1 text-sm">
-          Créer <strong>{{ aCreer.length }}</strong> ticket(s) dans le CRM et notifier <strong>{{ nbMembres }}</strong> membre(s) par e-mail ?
-          <span v-if="nbNonAffectees" class="text-ochre">{{ nbNonAffectees }} tâche(s) n'ont pas de responsable.</span>
-        </p>
-        <button class="btn-quiet" @click="confirming = false">Annuler</button>
-        <button class="btn" @click="valider">Confirmer</button>
-      </template>
     </div>
+
+    <div v-if="cahier.ambiguites.length" class="mt-4 rounded-2xl border border-purple-200 bg-purple-50 p-4">
+      <h3 class="flex items-center gap-2 text-sm font-semibold text-purple-900"><Icon name="alert" :size="16" /> Ambiguïtés et informations manquantes</h3>
+      <ul class="mt-2 list-disc space-y-1 pl-5 text-sm text-purple-900"><li v-for="a in cahier.ambiguites" :key="a">{{ a }}</li></ul>
+    </div>
+
+    <p v-if="sansMembre.length" class="mt-5 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert"><Icon name="alert" :size="16" class="mt-0.5 shrink-0" />
+      <span><b>{{ sansMembre.length }} tâche{{ sansMembre.length > 1 ? 's' : '' }} sans membre affecté</b> : {{ sansMembre.map((t: any) => t.titre).join(', ') }}. Aucun ticket n'est envoyé tant que chaque tâche n'a pas au moins un membre : utilisez le bouton « Affecter ».</span></p>
+    <p class="mb-4 mt-5 text-sm text-slate-600">Les membres sont affectés automatiquement selon leur profil et leur charge actuelle. Corrigez ce qui ne convient pas, puis validez.</p>
+
+    <!-- Tâches en fil conducteur : une ligne verticale relie les étapes -->
+    <ol class="relative space-y-3">
+      <span v-if="cahier.taches.length > 1" class="absolute bottom-6 left-[1.1rem] top-6 w-px bg-gradient-to-b from-brand-300 via-purple-300 to-sky-300" aria-hidden="true" />
+      <li v-for="(t, i) in cahier.taches" :key="t.id" class="rise relative flex gap-3" :class="affecter === t.id && 'z-40'" :style="{ animationDelay: Math.min(Number(i), 10) * 60 + 'ms' }">
+        <span class="relative z-10 mt-3 grid size-9 shrink-0 place-items-center rounded-full border-2 border-white text-xs font-semibold text-white shadow" :class="prio(t.priorite).c">{{ Number(i) + 1 }}</span>
+        <div class="card min-w-0 flex-1 transition hover:shadow-pop" :class="open.has(t.id) && 'ring-2 ring-brand-500/20'">
+          <div class="flex flex-wrap items-center gap-3 px-4 py-3">
+            <button class="grid size-7 place-items-center rounded-lg text-slate-400 transition hover:bg-brand-50 hover:text-brand-700" :aria-expanded="open.has(t.id)" aria-label="Déplier" @click="toggle(t.id)">
+              <Icon name="down" :size="16" class="transition-transform duration-300" :class="open.has(t.id) ? '' : '-rotate-90'" /></button>
+            <input v-model="t.titre" class="input min-w-48 flex-1 border-transparent! bg-transparent! font-medium shadow-none! hover:border-slate-300!" aria-label="Titre de la tâche" @change="save(t)" />
+            <select v-model="t.priorite" class="input w-auto! py-1.5" :class="prio(t.priorite).t" aria-label="Priorité" @change="save(t)"><option v-for="p in PRIORITES" :key="p.v" :value="p.v">{{ p.l }}</option></select>
+            <!-- Affectation : un ou plusieurs membres, directement depuis la ligne -->
+            <div class="relative" @click.stop>
+              <button type="button" class="inline-flex items-center gap-2 rounded-xl border bg-white px-2.5 py-1.5 text-sm transition hover:border-slate-400"
+                :class="affecter === t.id ? 'border-slate-900' : (membresDe(t).length ? 'border-line' : 'border-azur text-azur')" :aria-expanded="affecter === t.id" @click="affecter = affecter === t.id ? null : t.id">
+                <span v-if="membresDe(t).length" class="flex -space-x-2"><Avatar v-for="m in membresDe(t).slice(0, 3)" :key="m.id" :nom="m.nom" :src="photoCrm(m.photo)" :size="22" ring /></span>
+                <Icon v-else name="users" :size="15" />
+                <span class="font-medium" :class="membresDe(t).length > 0 && 'text-slate-700'">{{ membresDe(t).length ? (membresDe(t).length === 1 ? membresDe(t)[0].nom : membresDe(t).length + ' membres') : 'Affecter' }}</span>
+                <Icon name="down" :size="13" class="text-slate-400" /></button>
+              <div v-if="affecter === t.id" class="absolute right-0 z-30 mt-2 w-72 rounded-2xl border border-line bg-white p-2 shadow-pop">
+                <p class="px-2 pb-1.5 pt-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Cochez un ou plusieurs membres</p>
+                <ul class="max-h-64 overflow-y-auto">
+                  <li v-for="m in membres" :key="m.id"><label class="flex cursor-pointer items-center gap-2.5 rounded-xl px-2 py-1.5 transition hover:bg-slate-50">
+                    <input type="checkbox" class="accent-slate-900" :checked="(t.membre_ids || []).includes(m.id)" @change="toggleMembre(t, m.id)" />
+                    <Avatar :nom="m.nom" :src="photoCrm(m.photo)" :size="26" />
+                    <span class="min-w-0 flex-1 leading-tight"><span class="block truncate text-sm font-medium text-slate-900">{{ m.nom }}</span><span class="block truncate text-xs text-slate-500">{{ m.profil }}</span></span></label></li>
+                </ul>
+                <p class="mt-1 border-t border-line px-2 pt-2 text-xs text-slate-500">Chaque membre coché reçoit un e-mail à la validation.</p>
+              </div>
+            </div>
+            <label class="flex items-center gap-1.5 text-sm text-slate-600">
+              <input v-model.number="t.duree_estimee" type="number" min="1" class="input w-16! py-1.5 text-center" aria-label="Durée en jours" @change="save(t)" /> j</label>
+            <button class="btn-ghost btn-sm text-red-600" aria-label="Supprimer la tâche" @click="remove(t)"><Icon name="trash" :size="15" /></button>
+          </div>
+          <div v-if="t.depend_de?.length && !open.has(t.id)" class="flex flex-wrap items-center gap-1.5 rounded-b-2xl border-t border-line/70 bg-slate-50/60 px-4 py-1.5 text-xs text-slate-500">
+            <Icon name="link" :size="12" /> Dépend de <span v-for="d in t.depend_de" :key="d" class="badge-slate max-w-48 truncate">{{ titreDe(d) }}</span></div>
+          <Transition name="fade">
+            <div v-show="open.has(t.id)" class="space-y-4 border-t border-line px-4 py-4">
+              <div><label class="label">Description</label><textarea v-model="t.description" rows="3" class="input" @change="save(t)" /></div>
+              <div>
+                <p class="label">Critères d'acceptation <span class="font-normal text-slate-400">(générés à partir du document, modifiables)</span></p>
+                <ul v-if="(t.criteres_acceptation || []).length" class="space-y-1.5">
+                  <li v-for="(_c, i) in (t.criteres_acceptation as string[])" :key="i" class="flex items-center gap-2">
+                    <span class="grid size-6 shrink-0 place-items-center rounded-full bg-slate-100 text-xs font-semibold text-slate-600">{{ Number(i) + 1 }}</span>
+                    <input v-model="t.criteres_acceptation[i]" class="input flex-1" maxlength="400" :aria-label="'Critère ' + (Number(i) + 1)" @change="save(t)" />
+                    <button class="btn-ghost btn-sm text-red-600" type="button" aria-label="Retirer le critère" @click="retirerCritere(t, Number(i))"><Icon name="trash" :size="14" /></button></li>
+                </ul>
+                <p v-else class="text-xs text-slate-500">Cette tâche n'a plus de critère : des critères par défaut, tirés de son énoncé, seront ajoutés à la validation.</p>
+                <button class="btn-secondary btn-sm mt-2" type="button" :disabled="(t.criteres_acceptation || []).length >= 12" @click="ajouterCritere(t)">Ajouter un critère</button>
+              </div>
+              <div class="grid gap-4 md:grid-cols-2">
+                <div>
+                  <p class="label">Affectation <span class="font-normal text-slate-400">(proposée par l'IA, cliquez pour modifier)</span></p>
+                  <p v-if="t.profil_recommande" class="mb-2 text-xs text-slate-500">Profil recommandé : {{ t.profil_recommande }}</p>
+                  <div class="flex flex-wrap gap-1.5">
+                    <button v-for="m in membres" :key="m.id" type="button" :title="m.profil"
+                      class="chip" :class="(t.membre_ids || []).includes(m.id) ? 'chip-on' : 'chip-off'"
+                      @click="toggleMembre(t, m.id)"><Avatar :nom="m.nom" :src="photoCrm(m.photo)" :size="18" />{{ m.nom }}</button>
+                  </div>
+                </div>
+                <div><p class="label">Dépend de</p>
+                  <div class="mb-2 flex flex-wrap gap-1.5"><span v-for="d in t.depend_de" :key="d" class="badge-slate max-w-full truncate">{{ titreDe(d) }}</span>
+                    <span v-if="!t.depend_de.length" class="text-xs text-slate-400">Aucune dépendance</span></div>
+                  <details v-if="cahier.taches.length > 1" class="rounded-xl border border-slate-300 bg-white"><summary class="cursor-pointer px-3 py-1.5 text-sm text-slate-600">Modifier les dépendances</summary>
+                    <div class="max-h-44 space-y-0.5 overflow-y-auto border-t border-line p-2">
+                      <label v-for="o in cahier.taches.filter((x: any) => x.id !== t.id)" :key="o.id" class="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1 text-sm hover:bg-brand-50">
+                        <input type="checkbox" class="accent-brand-600" :checked="(t.depend_de || []).includes(o.ordre)" @change="toggleDep(t, o.ordre)" /><span class="truncate">{{ o.titre }}</span></label>
+                    </div></details></div>
+              </div>
+              <div class="flex flex-wrap items-center gap-x-5 gap-y-1 rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                <span><b>Priorité</b> : {{ t.raison_priorite || '—' }}</span>
+                <span class="flex items-center gap-1.5"><b>Confiance</b>
+                  <span class="h-1.5 w-16 overflow-hidden rounded-full bg-slate-200"><span class="block h-full rounded-full transition-all duration-700" :class="confiance(t.niveau_confiance)" :style="{ width: t.niveau_confiance * 100 + '%' }" /></span>
+                  {{ Math.round(t.niveau_confiance * 100) }} %</span>
+                <span v-if="t.duree_proposee !== t.duree_estimee">Durée proposée par l'agent : {{ t.duree_proposee }} j</span>
+              </div>
+              <p v-if="t.source_dans_document" class="border-l-2 border-brand-300 pl-3 text-xs text-slate-500">Source : « {{ t.source_dans_document }} »</p>
+              <p v-for="a in t.ambiguites" :key="a" class="flex items-start gap-1.5 text-xs text-purple-700"><Icon name="alert" :size="13" class="mt-0.5" />{{ a }}</p>
+            </div>
+          </Transition>
+        </div>
+      </li>
+    </ol>
+
+    <div class="sticky bottom-0 -mx-4 mt-6 flex flex-wrap items-center gap-3 border-t border-line bg-white/90 px-4 py-3 backdrop-blur sm:-mx-8 sm:px-8">
+      <p class="text-sm text-slate-600"><b class="text-slate-900">{{ cahier.taches.length }}</b> tâches · <b class="text-slate-900">{{ totalJours }}</b> jours cumulés</p>
+      <div class="ml-auto flex flex-wrap gap-2">
+        <button class="btn-danger" @click="abandonner">Abandonner</button>
+        <button class="btn-secondary" @click="ajouter"><Icon name="plus" :size="16" /> Ajouter une tâche</button>
+        <button class="btn-primary" :disabled="!cahier.taches.length || sansMembre.length > 0" :title="sansMembre.length ? 'Affectez d\'abord un membre à chaque tâche' : ''" @click="confirm = true"><Icon name="check" :size="16" /> Valider et créer les tickets</button>
+      </div>
+    </div>
+
+    <ConfirmModal :open="confirm" title="Valider ce cahier des charges ?" confirm-label="Valider et créer" :busy="validating" @confirm="valider" @cancel="confirm = false">
+      <p>Le projet « <b>{{ cahier.nom_projet }}</b> » sera créé, puis <b>{{ cahier.taches.length }}</b> ticket(s) dans le CRM avec leur échéance. Les membres affectés recevront un e-mail.</p>
+      <p class="mt-2 text-slate-500">Votre validation vaut autorisation : cette action ne peut pas être annulée depuis l'application.</p>
+    </ConfirmModal>
   </template>
 </template>
