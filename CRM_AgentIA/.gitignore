@@ -1,0 +1,102 @@
+
+# ==============================
+# ENVIRONNEMENTS VIRTUELS
+# ==============================
+venv/
+.venv/
+env/
+ENV/
+
+# ==============================
+# FICHIERS PYTHON
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ==============================
+# VARIABLES D'ENVIRONNEMENT
+# ==============================
+.env
+.env.*
+!.env.example
+
+# ==============================
+# IDE / EDITEURS
+# ==============================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==============================
+# TESTS ET COUVERTURE
+# ==============================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# ==============================
+# NOTEBOOKS
+# ==============================
+.ipynb_checkpoints/
+
+# ==============================
+# LOGS
+# ==============================
+*.log
+logs/
+
+# ==============================
+# FICHIERS TEMPORAIRES
+# ==============================
+*.tmp
+*.bak
+*.temp
+temp/
+tmp/
+
+# ==============================
+# BUILD / DISTRIBUTION
+# ==============================
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ==============================
+# OUTILS PYTHON
+# ==============================
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.dmypy.json
+
+# ==============================
+# BASES DE DONNÉES LOCALES
+# ==============================
+*.sqlite3
+*.db
+
+# ==============================
+# MODELES IA / OCR
+# ==============================
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.bin
+models/
+weights/
+
+# ==============================
+# FICHIERS SYSTEME
+# ==============================
+.DS_Store
+Thumbs.db
+desktop.ini
