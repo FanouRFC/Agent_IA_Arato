@@ -12,6 +12,7 @@ import ToastHost from '@/components/ToastHost.vue'
 import ConfirmHost from '@/components/ConfirmHost.vue'
 import { useConfirmStore } from '@/stores/confirm'
 import ThemeToggle from '@/components/ThemeToggle.vue'
+import LogoArato from '@/assets/img/logo.png'
 
 const route = useRoute()
 const router = useRouter()
@@ -81,9 +82,11 @@ async function logout() {
     <!-- Menu latéral : fixe, 18 rem + 1 cm de large, sans défilement interne -->
     <aside class="sidebar z-40 flex-col text-slate-300 shadow-[8px_0_30px_-18px_rgb(15_33_60/0.6)] lg:flex" :class="menuOpen ? 'flex' : 'hidden'" aria-label="Menu principal">
       <div class="relative flex items-center gap-3 px-6 pb-3 pt-5">
-        <span class="grid size-10 place-items-center rounded-2xl bg-gradient-to-br from-azur to-violet-arato text-white shadow-lg"><Icon name="sparkles" :size="19" /></span>
+        <span class="grid size-14 place-items-center rounded-2xl shadow-lg">
+          <img :src=LogoArato alt="Arato" class="size-14 object-contain" />
+        </span>
         <div class="leading-tight">
-          <p class="display text-[17px] leading-none text-white">Agent IA</p>
+          <p class="display text-[17px] leading-none text-white">TaskPilot</p>
           <p class="mt-1 text-[11px] text-ciel">Arato · suivi intelligent</p>
         </div>
       </div>
