@@ -15,6 +15,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from pydantic import BaseModel, Field
+
 from .config import settings
 from . import agent, llm, mailer, media, plain, projects, reports, service, settings_store
 from . import tools as T
@@ -44,7 +46,6 @@ def _crm_down(e: Exception) -> HTTPException:
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MDP_MIN = 8
 
-
 def _email(v: str) -> str:
     v = v.strip().lower()
     if not EMAIL_RE.match(v) or len(v) > 254:
@@ -62,18 +63,76 @@ class Login(BaseModel):
     mot_de_passe: str = Field(max_length=200)
 
 
+class OubliIn(BaseModel):
+    email: str
+    mot_de_passe: str = Field(min_length=8)
+    confirmation: str
+
+
+@public.post("/auth/mot-de-passe-oublie")
+def mot_de_passe_oublie(b: OubliIn, db: Session = Depends(get_db)):
+    email = _email(b.email)
+    if b.mot_de_passe != b.confirmation:
+        raise HTTPException(400, "Les deux mots de passe ne correspondent pas.")
+    u = db.scalars(select(User).where(User.email == email)).first()
+    if not u or u.statut != "accepte":
+        raise HTTPException(404, "Aucun compte accepté avec cet e-mail.")
+    u.password_hash = hash_password(b.mot_de_passe)
+    db.commit()
+    log_action(db, f"Mot de passe réinitialisé : {email}", email)
+    return {"ok": True}
+
+
 @public.post("/auth/login")
 def login(b: Login, request: Request, db: Session = Depends(get_db)):
     cle = f"{request.client.host if request.client else '?'}|{b.email.strip().lower()}"
     limite_connexion.verifier(cle)                       # 429 après trop d'échecs consécutifs
     u = db.scalars(select(User).where(User.email == b.email.strip().lower())).first()
     ok = verify_password(b.mot_de_passe, u.password_hash if u else _FAUSSE_EMPREINTE)
+    if u and ok and u.statut == "en_attente":
+        raise HTTPException(403, "Votre demande d'inscription est en attente de validation par un responsable.")
     if not u or not u.actif or not ok:
         limite_connexion.echec(cle)
         raise HTTPException(401, "E-mail ou mot de passe incorrect")
     limite_connexion.succes(cle)
     return {"token": create_token(u.email), "email": u.email}
 
+
+# ---------------- Inscription publique (compte créé DÉSACTIVÉ, à valider par un responsable) ----------------
+_INSCRIPTIONS: dict[str, list[float]] = {}
+_INSCR_LOCK = threading.Lock()
+INSCR_MAX_PAR_HEURE = 5        # tentatives par adresse IP
+ATTENTE_MAX = 20               # comptes en attente de validation au maximum
+
+
+def _limite_inscription(ip: str):
+    import time
+    now = time.time()
+    with _INSCR_LOCK:
+        essais = [t for t in _INSCRIPTIONS.get(ip, []) if now - t < 3600]
+        if len(essais) >= INSCR_MAX_PAR_HEURE:
+            _INSCRIPTIONS[ip] = essais
+            raise HTTPException(429, "Trop de tentatives. Réessayez plus tard.")
+        essais.append(now)
+        _INSCRIPTIONS[ip] = essais
+
+
+@public.post("/auth/inscription")
+def inscription(b: CompteIn, request: Request, db: Session = Depends(get_db)):
+    """Crée un compte responsable INACTIF : un responsable doit l'activer (Admin > Comptes)."""
+    _limite_inscription(request.client.host if request.client else "?")
+    email = _email(b.email)
+    _mdp(b.mot_de_passe)
+    if db.scalars(select(User).where(User.email == email)).first():
+        raise HTTPException(409, "Un compte existe déjà avec cet e-mail.")
+    en_attente = db.scalars(select(User).where(User.statut == "en_attente")).all()
+    if len(en_attente) >= ATTENTE_MAX:
+        raise HTTPException(503, "Trop de demandes en attente. Contactez un responsable.")
+    db.add(User(email=email, password_hash=hash_password(b.mot_de_passe), role="haut_responsable",
+                actif=False, statut="en_attente"))
+    db.commit()
+    log_action(db, f"Demande d'inscription : {email}", "système")
+    return {"ok": True}
 
 # ---------------- Comptes responsables : tous les comptes ont exactement les mêmes droits ----------------
 def _photo(u: User) -> Optional[str]:
@@ -82,9 +141,14 @@ def _photo(u: User) -> Optional[str]:
     return f"/avatars/{u.id}?v={v}" if v else None
 
 
-def _compte_out(u: User, courant: str) -> dict:
+def _principal_id(db: Session) -> Optional[int]:
+    """Le compte principal est le premier compte créé."""
+    return db.scalars(select(User.id).order_by(User.id).limit(1)).first()
+
+
+def _compte_out(u: User, courant: str, principal_id: Optional[int] = None) -> dict:
     return {"id": u.id, "email": u.email, "role": u.role, "actif": u.actif, "date_creation": u.date_creation,
-            "moi": u.email == courant, "photo": _photo(u)}
+            "moi": u.email == courant, "photo": _photo(u), "principal": u.id == principal_id}
 
 
 class CompteIn(BaseModel):
@@ -891,23 +955,65 @@ def rapport_pret(jeton: str):
     return Response(x[1], media_type=x[2], headers=x[3])
 
 
+def _exiger_principal(db: Session, user: str) -> int:
+    pid = _principal_id(db)
+    courant = db.scalars(select(User).where(User.email == user)).first()
+    if not courant or courant.id != pid:
+        raise HTTPException(403, "Seul le compte principal peut traiter les comptes.")
+    return pid
+
+
 @router.get("/comptes")
-def liste_comptes(db: Session = Depends(get_db), user: str = Depends(current_admin)):
-    return [_compte_out(u, user) for u in db.scalars(select(User).order_by(User.id))]
+def lister_comptes(db: Session = Depends(get_db), user: str = Depends(current_admin)):
+    pid = _principal_id(db)
+    rows = db.scalars(select(User).where(User.statut == "accepte").order_by(User.id)).all()
+    return [_compte_out(u, user, pid) for u in rows]
 
 
-@router.post("/comptes")
-def creer_compte(b: CompteIn, db: Session = Depends(get_db), user: str = Depends(current_admin)):
-    """Crée un compte responsable : mêmes droits que le compte connecté (un seul rôle)."""
-    email = _email(b.email)
-    _mdp(b.mot_de_passe)
-    if db.scalars(select(User).where(User.email == email)).first():
-        raise HTTPException(409, "Un compte existe déjà avec cet e-mail.")
-    u = User(email=email, password_hash=hash_password(b.mot_de_passe), role="haut_responsable", actif=True)
-    db.add(u)
+@router.put("/comptes/{uid}/actif")
+def basculer_actif(uid: int, b: ActifIn, db: Session = Depends(get_db), user: str = Depends(current_admin)):
+    pid = _exiger_principal(db, user)
+    u = db.get(User, uid)
+    if not u or u.statut != "accepte":
+        raise HTTPException(404, "Compte introuvable.")
+    if u.id == pid:
+        raise HTTPException(400, "Le compte principal ne peut pas être désactivé.")
+    u.actif = b.actif
     db.commit()
-    log_action(db, f"Compte responsable créé : {email}", user)
-    return _compte_out(u, user)
+    log_action(db, f"Compte {'activé' if b.actif else 'désactivé'} : {u.email}", user)
+    return _compte_out(u, user, pid)
+
+
+@router.get("/comptes/demandes")
+def lister_demandes(db: Session = Depends(get_db), user: str = Depends(current_admin)):
+    _exiger_principal(db, user)
+    rows = db.scalars(select(User).where(User.statut == "en_attente").order_by(User.id)).all()
+    return [{"id": u.id, "email": u.email, "date_creation": u.date_creation} for u in rows]
+
+
+@router.post("/comptes/{uid}/accepter")
+def accepter_demande(uid: int, db: Session = Depends(get_db), user: str = Depends(current_admin)):
+    _exiger_principal(db, user)
+    u = db.get(User, uid)
+    if not u or u.statut != "en_attente":
+        raise HTTPException(404, "Demande introuvable.")
+    u.statut, u.actif = "accepte", True
+    db.commit()
+    log_action(db, f"Inscription acceptée : {u.email}", user)
+    return {"ok": True}
+
+
+@router.post("/comptes/{uid}/refuser")
+def refuser_demande(uid: int, db: Session = Depends(get_db), user: str = Depends(current_admin)):
+    _exiger_principal(db, user)
+    u = db.get(User, uid)
+    if not u or u.statut != "en_attente":
+        raise HTTPException(404, "Demande introuvable.")
+    email = u.email
+    db.delete(u)
+    db.commit()
+    log_action(db, f"Inscription refusée : {email}", user)
+    return {"ok": True}
 
 
 @router.get("/compte/moi")
@@ -969,16 +1075,20 @@ def changer_mot_de_passe(b: MotDePasseIn, db: Session = Depends(get_db), user: s
 
 
 @router.put("/comptes/{uid}/actif")
-def activer_compte(uid: int, b: ActifIn, db: Session = Depends(get_db), user: str = Depends(current_admin)):
+def basculer_actif(uid: int, b: ActifIn, db: Session = Depends(get_db), user: str = Depends(current_admin)):
+    pid = _principal_id(db)
+    courant = db.scalars(select(User).where(User.email == user)).first()
+    if not courant or courant.id != pid:
+        raise HTTPException(403, "Seul le compte principal peut activer ou désactiver des comptes.")
     u = db.get(User, uid)
     if not u:
-        raise HTTPException(404, "Compte introuvable")
-    if u.email == user:
-        raise HTTPException(409, "Vous ne pouvez pas désactiver votre propre compte.")
+        raise HTTPException(404, "Compte introuvable.")
+    if u.id == pid:
+        raise HTTPException(400, "Le compte principal ne peut pas être désactivé.")
     u.actif = b.actif
     db.commit()
-    log_action(db, f"Compte {u.email} {'réactivé' if b.actif else 'désactivé'}", user)
-    return _compte_out(u, user)
+    log_action(db, f"Compte {'activé' if b.actif else 'désactivé'} : {u.email}", user)
+    return _compte_out(u, user, pid)
 
 
 # ---------------- Administration (bonus) et évaluation ----------------

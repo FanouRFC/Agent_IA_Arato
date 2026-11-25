@@ -13,6 +13,7 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(254), unique=True)
     password_hash: Mapped[str] = mapped_column(String(200))
+    statut: Mapped[str] = mapped_column(String(20), default="accepte", server_default=text("'accepte'"))
     role: Mapped[str] = mapped_column(String(30), default="haut_responsable")
     actif: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     date_creation: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.now)

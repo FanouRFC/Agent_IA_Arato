@@ -6,11 +6,9 @@ import { api, fmtDateTime, initiales, photoCompte, post, put } from "@/services/
 import { useAuthStore } from "@/stores/auth";
 import { useToastStore } from "@/stores/toast";
 import { useLlmStore } from "@/stores/llm";
-import PasswordInput from "@/components/PasswordInput.vue";
 import Avatar from "@/components/Avatar.vue";
 import ConfirmModal from "@/components/ConfirmModal.vue";
 import Icon from "@/components/Icon.vue";
-import Modal from "@/components/Modal.vue";
 import PageHeader from "@/components/PageHeader.vue";
 
 const confirmer = useConfirmStore()
@@ -158,7 +156,7 @@ async function supprimerEntrees() {
   supprBusy.value = false;
 }
 
-// ----- Comptes responsables (tous les comptes ont exactement les mêmes droits) -----
+// ----- Comptes responsables -----
 const comptes = ref<any[]>([]);
 const photoBusy = ref(false), fichierPhoto = ref<HTMLInputElement>();
 async function choisirPhoto(e: Event) {
@@ -190,10 +188,6 @@ async function retirerPhoto() {
   photoBusy.value = false;
 }
 const moi = computed(() => comptes.value.find((c) => c.moi));
-const nouveauCompte = ref({ email: "", mot_de_passe: "", confirmation: "" }),
-  modalCompte = ref(false),
-  compteBusy = ref(false),
-  compteErr = ref("");
 async function chargerComptes() {
   try {
     comptes.value = await api("/comptes");
@@ -201,30 +195,13 @@ async function chargerComptes() {
     toast.err(e.message);
   }
 }
-function ouvrirCompte() {
-  nouveauCompte.value = { email: "", mot_de_passe: "", confirmation: "" };
-  compteErr.value = "";
-  modalCompte.value = true;
-}
-async function creerCompte() {
-  compteErr.value = "";
-  const c = nouveauCompte.value;
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(c.email.trim())) return (compteErr.value = "Adresse e-mail invalide.");
-  if (c.mot_de_passe.length < 8) return (compteErr.value = "Le mot de passe doit contenir au moins 8 caractères.");
-  if (c.mot_de_passe !== c.confirmation) return (compteErr.value = "La confirmation ne correspond pas au mot de passe.");
-  compteBusy.value = true;
-  try {
-    await post("/comptes", { email: c.email, mot_de_passe: c.mot_de_passe });
-    modalCompte.value = false;
-    toast.ok("Compte créé : il dispose des mêmes droits que le vôtre.");
-    await Promise.all([chargerComptes(), chargerJournal()]);
-  } catch (e: any) {
-    compteErr.value = e.message;
-  }
-  compteBusy.value = false;
-}
+/** Active ou désactive un compte déjà accepté (compte principal uniquement). */
 async function basculerCompte(c: any) {
-  if (!(await confirmer.ask({ title: c.actif ? 'Désactiver ce compte ?' : 'Réactiver ce compte ?', message: c.actif ? `${c.email} ne pourra plus se connecter.` : `${c.email} pourra de nouveau se connecter.`, confirmLabel: c.actif ? 'Désactiver' : 'Réactiver' }))) return;
+  if (!(await confirmer.ask({
+    title: c.actif ? 'Désactiver ce compte ?' : 'Réactiver ce compte ?',
+    message: c.actif ? `${c.email} ne pourra plus se connecter.` : `${c.email} pourra de nouveau se connecter.`,
+    confirmLabel: c.actif ? 'Désactiver' : 'Réactiver',
+  }))) return;
   try {
     await put(`/comptes/${c.id}/actif`, { actif: !c.actif });
     toast.ok(c.actif ? "Compte désactivé." : "Compte réactivé.");
@@ -234,8 +211,40 @@ async function basculerCompte(c: any) {
   }
 }
 
+// ----- Demandes d'inscription : à accepter ou refuser par le compte principal -----
+const demandes = ref<any[]>([]),
+  demandeBusy = ref<number | null>(null);
+async function chargerDemandes() {
+  if (!moi.value?.principal) { demandes.value = []; return; }
+  try {
+    demandes.value = await api("/comptes/demandes");
+  } catch (e: any) {
+    toast.err(e.message);
+  }
+}
+async function traiterDemande(d: any, accepter: boolean) {
+  if (!(await confirmer.ask({
+    title: accepter ? 'Accepter cette inscription ?' : 'Refuser cette inscription ?',
+    message: accepter
+      ? `${d.email} pourra se connecter avec les mêmes droits que vous.`
+      : `La demande de ${d.email} sera supprimée.`,
+    confirmLabel: accepter ? 'Accepter' : 'Refuser',
+  }))) return;
+  demandeBusy.value = d.id;
+  try {
+    await post(`/comptes/${d.id}/${accepter ? 'accepter' : 'refuser'}`);
+    toast.ok(accepter ? "Compte accepté." : "Demande refusée.");
+    await chargerComptes();
+    await Promise.all([chargerDemandes(), chargerJournal()]);
+  } catch (e: any) {
+    toast.err(e.message);
+  }
+  demandeBusy.value = null;
+}
+
 async function load() {
-  chargerComptes();
+  await chargerComptes();
+  chargerDemandes();
   try {
     llm.value = await api("/admin/llm");
   } catch (e: any) {
@@ -294,6 +303,11 @@ onMounted(load);
         @click="tab = t.k"
       >
         <Icon :name="t.i" :size="15" />{{ t.l }}
+        <span
+          v-if="t.k === 'comptes' && demandes.length"
+          class="badge-blue"
+          :aria-label="`${demandes.length} demande(s) d'inscription`"
+        >{{ demandes.length }}</span>
       </button>
     </div>
 
@@ -506,52 +520,49 @@ onMounted(load);
           </div>
         </div>
 
+        <!-- Demandes d'inscription : visibles uniquement par le compte principal -->
+        <div v-if="moi?.principal && demandes.length" class="card border-amber-200">
+          <header class="flex flex-wrap items-center gap-3 border-b border-line px-6 py-4">
+            <h2 class="card-title">Demandes d'inscription</h2>
+            <span class="badge-blue">{{ demandes.length }}</span>
+          </header>
+          <ul class="divide-y divide-slate-100">
+            <li v-for="d in demandes" :key="d.id" class="flex flex-wrap items-center gap-4 px-6 py-3.5">
+              <Avatar :nom="d.email" :size="36" />
+              <div class="min-w-0 flex-1">
+                <p class="truncate text-sm font-medium text-slate-900">{{ d.email }}</p>
+                <p class="text-xs text-slate-400">Demandé le {{ fmtDateTime(d.date_creation) }}</p>
+              </div>
+              <button class="btn-ghost btn-sm" :disabled="demandeBusy === d.id" @click="traiterDemande(d, false)"><Icon name="x" :size="14" />Refuser</button>
+              <button class="btn-primary btn-sm" :disabled="demandeBusy === d.id" @click="traiterDemande(d, true)"><Icon name="check" :size="14" />Accepter</button>
+            </li>
+          </ul>
+        </div>
+
         <div class="card">
           <header class="flex flex-wrap items-center gap-3 border-b border-line px-6 py-4">
             <h2 class="card-title">Comptes responsables</h2>
             <span class="badge-slate">{{ comptes.length }}</span>
-            <button class="btn-primary btn-sm ml-auto" @click="ouvrirCompte"><Icon name="plus" :size="14" />Nouveau compte</button>
           </header>
           <p class="border-b border-line bg-slate-50/60 px-6 py-2.5 text-xs text-slate-500">
-            Tous les comptes ont exactement les mêmes droits que le responsable.
+            Les nouvelles inscriptions apparaissent dans « Demandes d'inscription » et doivent être acceptées par le compte principal. Ici, vous pouvez désactiver ou réactiver un compte déjà accepté.
           </p>
           <ul class="divide-y divide-slate-100">
             <li v-for="c in comptes" :key="c.id" class="flex flex-wrap items-center gap-4 px-6 py-3.5">
               <Avatar :nom="c.email" :src="photoCompte(c.photo)" :size="36" />
               <div class="min-w-0 flex-1">
-                <p class="truncate text-sm font-medium text-slate-900">{{ c.email }}<span v-if="c.moi" class="badge-blue ml-2">Vous</span></p>
+                <p class="truncate text-sm font-medium text-slate-900">{{ c.email }}
+                  <span v-if="c.moi" class="badge-blue ml-2">Vous</span>
+                  <span v-if="c.principal" class="badge-slate ml-2">Principal</span>
+                </p>
                 <p class="text-xs text-slate-400">Créé le {{ fmtDateTime(c.date_creation) }}</p>
               </div>
               <span :class="c.actif ? 'badge-green' : 'badge-slate'">{{ c.actif ? "Actif" : "Désactivé" }}</span>
-              <button v-if="!c.moi" class="btn-secondary btn-sm" @click="basculerCompte(c)">{{ c.actif ? "Désactiver" : "Réactiver" }}</button>
+              <button v-if="moi?.principal && !c.principal" :class="c.actif ? 'btn-secondary btn-sm' : 'btn-primary btn-sm'" @click="basculerCompte(c)">{{ c.actif ? "Désactiver" : "Réactiver" }}</button>
             </li>
           </ul>
         </div>
-
       </section>
-
-      <Modal :open="modalCompte" size="md" title="Nouveau compte responsable" subtitle="Le compte aura exactement les mêmes droits que le vôtre." @close="modalCompte = false">
-        <form id="form-compte" class="space-y-4" @submit.prevent="creerCompte">
-          <div>
-            <label class="label" for="nc-e">Adresse e-mail</label>
-            <input id="nc-e" v-model="nouveauCompte.email" type="email" class="input" autocomplete="off" required />
-          </div>
-          <div>
-            <label class="label" for="nc-m">Mot de passe</label>
-            <PasswordInput id="nc-m" v-model="nouveauCompte.mot_de_passe" autocomplete="new-password" :minlength="8" required />
-            <p class="mt-1 text-xs text-slate-400">8 caractères minimum.</p>
-          </div>
-          <div>
-            <label class="label" for="nc-c">Confirmation du mot de passe</label>
-            <PasswordInput id="nc-c" v-model="nouveauCompte.confirmation" autocomplete="new-password" required />
-          </div>
-          <p v-if="compteErr" class="flex items-center gap-1.5 text-sm text-red-600" role="alert"><Icon name="alert" :size="14" />{{ compteErr }}</p>
-        </form>
-        <template #footer>
-          <button class="btn-secondary" type="button" @click="modalCompte = false">Annuler</button>
-          <button class="btn-primary" type="submit" form="form-compte" :disabled="compteBusy">{{ compteBusy ? "Création…" : "Créer le compte" }}</button>
-        </template>
-      </Modal>
     </template>
   </div>
 </template>

@@ -53,6 +53,8 @@ def _migrer_utilisateurs():
             conn.execute(text("UPDATE utilisateurs SET email = lower(email) WHERE email LIKE '%@%'"))
         if "actif" not in cols:
             conn.execute(text("ALTER TABLE utilisateurs ADD COLUMN actif BOOLEAN NOT NULL DEFAULT TRUE"))
+        if "statut" not in cols:
+            conn.execute(text("ALTER TABLE utilisateurs ADD COLUMN statut VARCHAR(20) NOT NULL DEFAULT 'accepte'"))
         if "date_creation" not in cols:
             conn.execute(text("ALTER TABLE utilisateurs ADD COLUMN date_creation TIMESTAMP DEFAULT now()"))
 

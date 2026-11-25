@@ -21,6 +21,8 @@ const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
     { path: '/login', name: 'login', component: () => import('@/views/Login.vue'), meta: { bare: true, public: true } },
+    { path: '/mot-de-passe-oublie', component: () => import('@/views/MotDePasseOublie.vue'), meta: { public: true } },
+{ path: '/reinitialiser', component: () => import('@/views/Reinitialiser.vue'), meta: { public: true } },
     // Simulateur du CRM (démonstration uniquement) : les membres y travaillent sur leurs tickets
     { path: '/crm', name: 'crm', component: () => import('@/views/CrmSimulateur.vue'), meta: { bare: true, public: true } },
 
@@ -44,6 +46,8 @@ const router = createRouter({
     { path: '/cahiers', redirect: '/' },
     { path: '/importer', redirect: '/' },
     { path: '/:pathMatch(.*)*', redirect: '/' },
+
+    { path: '/inscription', name: 'inscription', component: () => import('@/views/Inscription.vue'), meta: { bare: true, public: true } },
   ],
 })
 
@@ -53,6 +57,7 @@ router.beforeEach((to) => {
   if (!to.meta.public && !auth.isAuthenticated) return { name: 'login' }
   if (to.name === 'login' && auth.isAuthenticated) return { name: 'cahiers' }
   if (to.meta.projet && !useProjectStore().activeId) return { name: 'projets' }
+  if ((to.name === 'login' || to.name === 'inscription') && auth.isAuthenticated) return { name: 'cahiers' }
   return true
 })
 
